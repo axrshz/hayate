@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hayate"
+version = "0.1.0"
+description = "Minimal LLM inference engine for learning modern serving internals."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "torch",
+  "transformers",
+  "safetensors",
+]
+
+[tool.setuptools]
+packages = ["hayate"]
