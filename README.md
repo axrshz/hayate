@@ -6,13 +6,13 @@ a minimal llm inference engine inspired by vLLM built from scratch using qwen3 0
 
 ### phase 1 — transformer forward pass
 
-- [ ] load qwen3 0.6b weights from huggingface (use `transformers` only for tokenizer + weight loading)
-- [ ] implement token embeddings + rotary positional embeddings (rope)
-- [ ] implement grouped query attention (gqa) — qwen3 uses 16q / 8kv heads
-- [ ] implement swiglu mlp block
-- [ ] implement rmsnorm + residual connections
-- [ ] implement greedy decoding loop (autoregressive, one token at a time)
-- [ ] verify outputs match huggingface's generate() for the same prompt
+- [x] load qwen3 0.6b weights from huggingface (use `transformers` only for tokenizer + weight loading)
+- [x] implement token embeddings + rotary positional embeddings (rope)
+- [x] implement grouped query attention (gqa) — qwen3 uses 16q / 8kv heads
+- [x] implement swiglu mlp block
+- [x] implement rmsnorm + residual connections
+- [x] implement greedy decoding loop (autoregressive, one token at a time)
+- [x] verify outputs match huggingface's generate() for the same prompt
 
 ---
 
