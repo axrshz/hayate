@@ -1,0 +1,39 @@
+# Python cache/build artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local model/tokenizer artifacts and large binaries
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.onnx
+
+# Hugging Face local cache/download folders (if created in repo)
+hf_cache/
+models/
+
+# Jupyter artifacts
+.ipynb_checkpoints/
+
+# IDE/OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
