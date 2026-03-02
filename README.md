@@ -1,6 +1,6 @@
 ## Hayate
 
-minimal inference engine for qwen 3 0.6B.
+minimal inference engine for qwen 3 0.6B. (wip.)
 
 ### Checklist
 
