@@ -5,7 +5,7 @@ minimal inference engine for qwen 3 0.6B. (wip.)
 ### Checklist
 
 - [x] qwen 3 architecture
-- [ ] kv cache
+- [x] kv cache
 - [ ] continuous batching
 - [ ] paged attention
 
