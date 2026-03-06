@@ -3,6 +3,7 @@ import argparse
 import torch
 from transformers import AutoTokenizer
 
+from engine import KVCache
 from model import load_pretrained_qwen3_0_6b
 from sampler import sample_next_token
 
@@ -22,13 +23,24 @@ def pick_dtype(device):
 @torch.inference_mode()
 def generate(model, input_ids, max_new_tokens, temperature, top_k, eos_token_id=None):
     tokens = input_ids
+    generated = []
+
+    cache = KVCache(n_layers=model.cfg["n_layers"])
+    model.reset_kv_cache()
+    logits = model(tokens, cache=cache)
+
     for _ in range(max_new_tokens):
-        logits = model(tokens)[:, -1, :]
-        next_token = sample_next_token(logits, temperature=temperature, top_k=top_k)
-        tokens = torch.cat([tokens, next_token], dim=1)
+        next_logits = logits[:, -1, :]
+        next_token = sample_next_token(next_logits, temperature=temperature, top_k=top_k)
+        generated.append(next_token)
+
         if eos_token_id is not None and torch.all(next_token.squeeze(-1) == eos_token_id):
             break
-    return tokens
+        logits = model(next_token, cache=cache)
+
+    if generated:
+        return torch.cat(generated, dim=1)
+    return input_ids.new_empty((input_ids.size(0), 0))
 
 
 def build_prompt(tokenizer, prompt, use_chat_template):
@@ -62,7 +74,6 @@ def main():
 
     prompt_text = build_prompt(tokenizer, args.prompt, args.chat)
     input_ids = tokenizer(prompt_text, return_tensors="pt").input_ids.to(device)
-    input_len = input_ids.size(1)
 
     output_ids = generate(
         model=model,
@@ -73,7 +84,7 @@ def main():
         eos_token_id=tokenizer.eos_token_id,
     )
 
-    completion_ids = output_ids[0, input_len:]
+    completion_ids = output_ids[0]
     completion_text = tokenizer.decode(completion_ids, skip_special_tokens=False)
     print(completion_text)
 
