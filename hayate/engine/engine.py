@@ -6,7 +6,7 @@ from queue import Queue
 
 from hayate.model import Qwen3Model
 from hayate.utils import load_weights
-from hayate.model.cache import Cache, PrefixCache
+from hayate.model.cache import Cache
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -42,7 +42,6 @@ class Engine:
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
         self.pool = Queue()
         self.current_batch = []
-        self.prefix_cache = PrefixCache()
         self.request_id = 0
 
 
@@ -72,10 +71,10 @@ class Engine:
         next_tokens = torch.where(mask.unsqueeze(-1), sampled, greedy)
         return next_tokens  # (B, 1)
     
-    def _forward_pass(self, tokens, caches, cache_positions):
+    def _forward_pass(self, tokens, caches, cache_positions, pad_lengths=None):
         """does one forward pass of the model and returns the next token"""
         with torch.no_grad():
-            logits = self.model(tokens, caches=caches, start_positions=cache_positions)
+            logits = self.model(tokens, caches=caches, start_positions=cache_positions, pad_lengths=pad_lengths)
         return logits[:, -1, :]
 
     def prefill_batch(self, requests: List[Request]):
@@ -84,51 +83,37 @@ class Engine:
         all_tokens = [self.tokenizer.encode(r.prompt) for r in requests]
         max_len = max(len(t) for t in all_tokens)
 
-        # pad all to max_len (pad on the left so the last token is always real)
         pad_id = self.tokenizer.pad_token_id or 0
         padded = [([pad_id] * (max_len - len(t))) + t for t in all_tokens]
+        pad_lengths = [max_len - len(t) for t in all_tokens]
         tokens = torch.tensor(padded, device=device)  # (B, max_len)
 
-        # start positions are all 0 since these are fresh requests
         caches = [r.kv_cache if r.use_cache else None for r in requests]
         start_positions = [0] * len(requests)
 
-        logits = self._forward_pass(tokens, caches, start_positions)  # (B, vocab)
+        logits = self._forward_pass(tokens, caches, start_positions, pad_lengths=pad_lengths)
         temps = torch.tensor([[r.temperature] for r in requests], device=device)
         next_tokens = self.sample(logits, temps)  # (B, 1)
 
         for i, request in enumerate(requests):
             request.prompt_tokens = all_tokens[i]
             request.tokens.append(next_tokens[i].item())
-            request.cache_pos = max_len  # all requests share the same padded length
+
+            actual_len = len(all_tokens[i])
+            pl = pad_lengths[i]
+
+            # Trim pad-token entries from the KV cache so decode
+            # starts with clean positional state
+            if pl > 0 and request.use_cache:
+                for layer_idx in range(self.num_layers):
+                    cached = request.kv_cache.get(layer_idx)
+                    if cached is not None:
+                        k, v = cached
+                        request.kv_cache.update(layer_idx, (k[:, :, pl:, :], v[:, :, pl:, :]))
+
+            request.cache_pos = actual_len
             request.is_prefill = False
 
-            if request.use_cache:
-                self.prefix_cache.store(all_tokens[i], [request.kv_cache.get(j) for j in range(self.num_layers)])
-
-
-    def _prefill_with_cache(self, request: Request):
-        """prefill a single request that has a prefix cache hit, skipping redundant prefix computation"""
-        prompt_tokens = request.prompt_tokens
-        match_len, cached_kv = self.prefix_cache.lookup(prompt_tokens)
-
-        # for exact match we trim last position so we can recompute it for logits
-        use_len = min(match_len, len(prompt_tokens) - 1)
-        for layer_idx, (k, v) in enumerate(cached_kv):
-            request.kv_cache.update(layer_idx, (k[:, :, :use_len, :].clone(), v[:, :, :use_len, :].clone()))
-
-        remaining = torch.tensor(prompt_tokens[use_len:]).unsqueeze(0).to(device)
-        logits = self._forward_pass(remaining, [request.kv_cache], [use_len])
-
-        temps = torch.tensor([[request.temperature]], device=device)
-        next_token = self.sample(logits, temps)
-        request.tokens.append(next_token.item())
-
-        request.cache_pos = len(prompt_tokens)
-        request.is_prefill = False
-
-        self.prefix_cache.store(prompt_tokens, [request.kv_cache.get(i) for i in range(self.num_layers)])
-    
     def decode_batch(self, requests: List[Request]):
         """the decode step for a batch of requests in a single forward pass."""
         # stack the last token of each request: (B, 1)
@@ -165,27 +150,8 @@ class Engine:
         prefill_requests = [r for r in self.current_batch if r.is_prefill]
         decode_requests  = [r for r in self.current_batch if not r.is_prefill]
 
-        # split prefill into cache hits (handled individually) and misses (batched)
-        cache_hits, cache_misses = [], []
-        for request in prefill_requests:
-            if request.use_cache:
-                prompt_tokens = self.tokenizer.encode(request.prompt)
-                request.prompt_tokens = prompt_tokens  
-                match_len, _ = self.prefix_cache.lookup(prompt_tokens)
-                match_ratio = match_len / len(prompt_tokens)
-                # why ratio? if we use a len based matching, even if a single token match, we use prefill cache but prefill cache has no batching, so we lose 
-                # throughput
-                if match_ratio > 0.3: # tune this 
-                    cache_hits.append(request)
-                    continue
-            cache_misses.append(request)
-
-        for request in cache_hits:
-            self._prefill_with_cache(request)
-
-        # prefill misses in smaller batches to not OOM the GPU
-        for i in range(0, len(cache_misses), MAX_PREFILL_BATCH):
-            chunk = cache_misses[i : i + MAX_PREFILL_BATCH]
+        for i in range(0, len(prefill_requests), MAX_PREFILL_BATCH):
+            chunk = prefill_requests[i : i + MAX_PREFILL_BATCH]
             self.prefill_batch(chunk)
 
         # decode in one batched forward pass

@@ -26,7 +26,7 @@ class GroupedQueryAttention(nn.Module):
         self.q_norm = nn.RMSNorm(head_dim, eps=1e-6, dtype=dtype)
         self.k_norm = nn.RMSNorm(head_dim, eps=1e-6, dtype=dtype)
 
-    def forward(self, x, mask, cos, sin, start_positions, caches):
+    def forward(self, x, mask, cos, sin, position_ids, caches):
         batch_size, num_tokens, _ = x.shape
 
         queries = self.q_proj(x)
@@ -45,8 +45,8 @@ class GroupedQueryAttention(nn.Module):
         values = values.transpose(1, 2)
         queries = queries.transpose(1, 2)
 
-        keys = apply_rope_vectorized(keys, cos, sin, start_positions)
-        queries = apply_rope_vectorized(queries, cos, sin, start_positions)
+        keys = apply_rope_vectorized(keys, cos, sin, position_ids)
+        queries = apply_rope_vectorized(queries, cos, sin, position_ids)
 
         next_caches = []
         keys_list, values_list = [], []

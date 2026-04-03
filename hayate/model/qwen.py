@@ -43,10 +43,23 @@ class Qwen3Model(nn.Module):
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
 
-    def forward(self, token_ids, caches, start_positions):
+    def forward(self, token_ids, caches, start_positions, pad_lengths=None):
         batch_size, num_tokens = token_ids.shape
         x = self.embed_tokens(token_ids)
 
+        # Build position_ids: (B, num_tokens) with correct absolute positions
+        positions = torch.arange(num_tokens, device=x.device, dtype=torch.long).unsqueeze(0)
+        sp_tensor = torch.tensor(start_positions, device=x.device, dtype=torch.long).unsqueeze(1)
+        position_ids = positions + sp_tensor  # (B, num_tokens)
+
+        if pad_lengths is not None:
+            position_ids = position_ids.clone()
+            for i, pl in enumerate(pad_lengths):
+                if pl > 0:
+                    position_ids[i, :pl] = 0
+                    position_ids[i, pl:] = torch.arange(num_tokens - pl, device=x.device)
+
+        # Causal mask
         max_seq = max(start_positions) + num_tokens
         full_mask = torch.triu(
             torch.ones(max_seq, max_seq, device=x.device, dtype=torch.bool),
@@ -59,9 +72,15 @@ class Qwen3Model(nn.Module):
             mask_rows.append(row)
         mask = torch.stack(mask_rows, dim=0).unsqueeze(1)
 
+        # Block real tokens from attending to left-pad positions
+        if pad_lengths is not None:
+            for i, pl in enumerate(pad_lengths):
+                if pl > 0:
+                    mask[i, :, pl:, :pl] = True
+
         for layer_idx, block in enumerate(self.layers):
             layer_caches = [(c.get(layer_idx) if c is not None else None) for c in caches]
-            x, new_layer_caches = block(x, mask, self.cos, self.sin, start_positions, layer_caches)
+            x, new_layer_caches = block(x, mask, self.cos, self.sin, position_ids, layer_caches)
 
             for i, c in enumerate(caches):
                 if c is not None:
