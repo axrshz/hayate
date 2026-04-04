@@ -1,7 +1,6 @@
-from typing import List, Optional
-
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .rope import apply_rope_vectorized
 from hayate.utils import pad_to
@@ -15,7 +14,6 @@ class GroupedQueryAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.num_kv_groups = num_kv_groups
-        self.group_size = num_heads // num_kv_groups
 
         self.q_proj = nn.Linear(d_in, num_heads * head_dim, bias=False, dtype=dtype)
         self.k_proj = nn.Linear(d_in, num_kv_groups * head_dim, bias=False, dtype=dtype)
@@ -65,13 +63,24 @@ class GroupedQueryAttention(nn.Module):
         keys_padded = torch.cat([pad_to(k, max_seq) for k in keys_list], dim=0)
         values_padded = torch.cat([pad_to(v, max_seq) for v in values_list], dim=0)
 
-        keys_padded = keys_padded.repeat_interleave(self.group_size, dim=1)
-        values_padded = values_padded.repeat_interleave(self.group_size, dim=1)
+        # mask: (B, 1, T_q, T_k) bool, True = invalid — SDPA additive mask uses 0 / -inf
+        attn_mask = torch.zeros(
+            batch_size, 1, num_tokens, max_seq,
+            device=queries.device, dtype=torch.float32,
+        )
+        attn_mask = attn_mask.masked_fill(mask, float("-inf"))
 
-        attn_scores = queries @ keys_padded.transpose(2, 3)
-        attn_scores = attn_scores.masked_fill(mask, -torch.inf)
-        attn_weights = torch.softmax(attn_scores / self.head_dim ** 0.5, dim=-1)
-
-        context_vec = (attn_weights @ values_padded).transpose(1, 2)
-        context_vec = context_vec.reshape(batch_size, num_tokens, self.num_heads * self.head_dim)
+        # PyTorch SDPA (Flash/Memory-efficient/Math); enable_gqa avoids expanding KV heads
+        context_vec = F.scaled_dot_product_attention(
+            queries,
+            keys_padded,
+            values_padded,
+            attn_mask=attn_mask,
+            dropout_p=0.0,
+            is_causal=False,
+            enable_gqa=True,
+        )
+        context_vec = context_vec.transpose(1, 2).reshape(
+            batch_size, num_tokens, self.num_heads * self.head_dim
+        )
         return self.o_proj(context_vec), next_caches
