@@ -41,7 +41,7 @@ def benchmark_sequential(engine, requests):
 
     for i, (prompt, max_tokens) in enumerate(requests):
         start = time.perf_counter()
-        result = engine.generate_text(prompt, max_tokens=max_tokens, temperature=0.0)
+        result = engine.generate_text(prompt, max_tokens=max_tokens)
         elapsed = time.perf_counter() - start
 
         actual_tokens = len(result.tokens)
@@ -63,7 +63,7 @@ def benchmark_batched(engine, requests):
     avg_max_tokens = int(sum(m for _, m in requests) / len(requests))
 
     start = time.perf_counter()
-    results = engine.generate_text(prompts, max_tokens=avg_max_tokens, temperature=0.0)
+    results = engine.generate_text(prompts, max_tokens=avg_max_tokens)
     elapsed = time.perf_counter() - start
 
     if not isinstance(results, list):

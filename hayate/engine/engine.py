@@ -19,7 +19,6 @@ class Request:
     id: int = 0
     prompt: str = ""
     max_tokens: int = 100
-    temperature: float = 0
 
     prompt_tokens: List[int] = field(default_factory=list)
     tokens: List[int] = field(default_factory=list)
@@ -140,14 +139,14 @@ class Engine:
  
         return True
     
-    def generate_text(self, prompts: Union[str, List[str]], max_tokens: int = 100, temperature: float = 0.0):
+    def generate_text(self, prompts: Union[str, List[str]], max_tokens: int = 100):
         """the public api for generation"""
         if isinstance(prompts, str):
             prompts = [prompts]
         
         requests = []
         for prompt in prompts:
-            req = Request(id=self.request_id, prompt=prompt, max_tokens=max_tokens, temperature=temperature)
+            req = Request(id=self.request_id, prompt=prompt, max_tokens=max_tokens)
             self.request_id += 1
             self.add_request(req)
             requests.append(req)
