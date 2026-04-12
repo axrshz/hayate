@@ -10,20 +10,20 @@ from hayate.model.cache import Cache
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-MAX_BATCH_SIZE = 20      # was 50, reduced for ~8GB model
-MAX_DECODE_BATCH = 20    # was 50
-MAX_PREFILL_BATCH = 8    # was 30
+MAX_BATCH_SIZE = 20
+MAX_DECODE_BATCH = 20
+MAX_PREFILL_BATCH = 8
 
 @dataclass
 class Request:
     id: int = 0
     prompt: str = ""
     max_tokens: int = 100
-    temperature: float = 0.1
+    temperature: float = 0
 
     prompt_tokens: List[int] = field(default_factory=list)
     tokens: List[int] = field(default_factory=list)
-    kv_cache: Cache | None = field(default_factory=lambda: Cache(n_layers=36))  # was 16
+    kv_cache: Cache | None = field(default_factory=lambda: Cache(n_layers=36))
 
     cache_pos: int = 0
     is_completed: bool = False
@@ -49,27 +49,9 @@ class Engine:
         """adds a request in the pool"""
         self.pool.put(request)
 
-    def sample(self, logits, temperatures: torch.Tensor):
-        """
-        logits: (B, vocab_size)
-        temperatures: (B, 1)
-        """
-        temperatures = temperatures.to(dtype=logits.dtype, device=logits.device)
-        mask = temperatures.squeeze(-1) > 0.0
-
-        scaled = logits.clone()
-        scaled[mask] = scaled[mask] / temperatures[mask]
-        scaled[mask] = scaled[mask] - scaled[mask].max(dim=-1, keepdim=True).values
-        probs = torch.softmax(scaled, dim=-1)  # (B, vocab)
-
-        # greedy for zero-temp rows
-        greedy = torch.argmax(logits, dim=-1, keepdim=True)  # (B, 1)
-
-        # sample for nonzero-temp rows
-        sampled = torch.multinomial(probs, num_samples=1)    # (B, 1)
-
-        next_tokens = torch.where(mask.unsqueeze(-1), sampled, greedy)
-        return next_tokens  # (B, 1)
+    def sample(self, logits):
+        """select the next token greedily via argmax"""
+        return torch.argmax(logits, dim=-1, keepdim=True)
     
     def _forward_pass(self, tokens, caches, cache_positions, pad_lengths=None):
         """does one forward pass of the model and returns the next token"""
@@ -92,8 +74,7 @@ class Engine:
         start_positions = [0] * len(requests)
 
         logits = self._forward_pass(tokens, caches, start_positions, pad_lengths=pad_lengths)
-        temps = torch.tensor([[r.temperature] for r in requests], device=device)
-        next_tokens = self.sample(logits, temps)  # (B, 1)
+        next_tokens = self.sample(logits)  # (B, 1)
 
         for i, request in enumerate(requests):
             request.prompt_tokens = all_tokens[i]
@@ -118,12 +99,11 @@ class Engine:
         """the decode step for a batch of requests in a single forward pass."""
         # stack the last token of each request: (B, 1)
         tokens = torch.tensor([[r.tokens[-1]] for r in requests], device=device)
-        caches = [r.kv_cache for r in requests]
+        caches = [r.kv_cache for r in requests]  
         start_positions = [r.cache_pos for r in requests]
 
         logits = self._forward_pass(tokens, caches, start_positions)
-        temps = torch.tensor([[r.temperature] for r in requests], device=device)  # (B, 1)
-        next_tokens = self.sample(logits, temps) 
+        next_tokens = self.sample(logits)
 
         for i, request in enumerate(requests):
             request.cache_pos += 1
@@ -134,9 +114,9 @@ class Engine:
                 request.response = self.tokenizer.decode(request.tokens)
 
     def _get_next_batch(self):
-        self.current_batch = [_req for _req in self.current_batch if not _req.is_completed]  # in the current batch keep the ones not completed
+        self.current_batch = [_req for _req in self.current_batch if not _req.is_completed]  # in the current
 
-        # now to fill the remaining gap, add many new requests from the pool
+
         while not self.pool.empty() and len(self.current_batch) < MAX_BATCH_SIZE:
             self.current_batch.append(self.pool.get())
 
@@ -154,13 +134,13 @@ class Engine:
             chunk = prefill_requests[i : i + MAX_PREFILL_BATCH]
             self.prefill_batch(chunk)
 
-        # decode in one batched forward pass
+
         if decode_requests:
             self.decode_batch(decode_requests)
  
         return True
     
-    def generate_text(self, prompts: Union[str, List[str]], max_tokens: int = 100, temperature: float = 0.1):
+    def generate_text(self, prompts: Union[str, List[str]], max_tokens: int = 100, temperature: float = 0.0):
         """the public api for generation"""
         if isinstance(prompts, str):
             prompts = [prompts]
@@ -172,7 +152,7 @@ class Engine:
             self.add_request(req)
             requests.append(req)
         
-        # run engine loop
+
         while self.generate():
             pass
 
