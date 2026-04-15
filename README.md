@@ -10,5 +10,4 @@ inference engine for qwen3-4b. wip.
 - [x] continous batching
 - [ ] torch.compile
 - [ ] paged attention
-- [ ] turboquant kv cache
 - [ ] custom kernels
