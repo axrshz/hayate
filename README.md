@@ -9,5 +9,6 @@ inference engine for small language models. wip.
 - [x] greedy decoding
 - [x] continous batching
 - [ ] torch.compile
+- [ ] turboquant
 - [ ] paged attention
 - [ ] custom kernels
