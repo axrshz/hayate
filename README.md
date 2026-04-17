@@ -54,8 +54,7 @@ benchmarks on an `NVIDIA A40 (47.7GB)`:
   mode                       mean        p50        p95  total tok/s
   -------------------- ---------- ---------- ---------- ------------
   single request           8.237s     8.218s     8.540s       58.39
-  submit all upfront      17.567s    17.515s    17.671s      273.81
-  staggered arrivals      17.361s    17.353s    17.596s      273.31
+  continous batching      17.361s    17.353s    17.596s      273.31
 ```
 
 ## Todo
