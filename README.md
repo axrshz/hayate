@@ -1,6 +1,10 @@
 # hayate
 
+<<<<<<< HEAD
 Inference engine for `Qwen/Qwen3-4B`. WIP.
+=======
+inference engine for small language models. wip.
+>>>>>>> d2b6bb14807e02d027a3768cd26821d8657e8251
 
 ## Setup
 
@@ -60,11 +64,11 @@ benchmarks on an `NVIDIA A40 (47.7GB)`:
 
 ## Todo
 
-- [x] model architecture
+- [x] model architecture (currently qwen3-4b)
 - [x] kv caching
 - [x] greedy decoding
 - [x] continuous batching
 - [ ] torch.compile
+- [ ] turboquant
 - [ ] paged attention
-- [ ] turboquant kv cache
 - [ ] custom kernels
