@@ -22,89 +22,162 @@ class Request:
 
     prompt_tokens: List[int] = field(default_factory=list)
     tokens: List[int] = field(default_factory=list)
-    kv_cache: Cache | None = field(default_factory=lambda: Cache(n_layers=36))
+    kv_cache: Cache | None = None
 
     cache_pos: int = 0
     is_completed: bool = False
     is_prefill: bool = True
     use_cache: bool = True
 
-    response: str = None
+    response: str | None = None
 
 
 class Engine:
-    def __init__(self, model_name: str, compile_model: bool = False):
+    def __init__(self, model_name: str, compile: bool = False):
         self.model = Qwen3Model()
         self.num_layers = self.model.num_layers
+        self.num_kv_groups = self.model.num_kv_groups
+        self.head_dim = self.model.head_dim
         load_weights(self.model, model_name)
         self.model = self.model.to(device)
-        if compile_model:
-            self.model = torch.compile(self.model)
+        if compile:
+            # dynamic=True tells Dynamo to treat varying (B, T, L_prev) as symbolic,
+            # avoiding a recompile per unique shape combo. First forward still pays
+            # a multi-minute trace/compile cost.
+            self.model = torch.compile(self.model, dynamic=True)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
-        self.pool = Queue()
-        self.current_batch = []
+        self.pool: Queue = Queue()
+        self.current_batch: List[Request] = []
         self.request_id = 0
-
 
     def add_request(self, request: Request):
         """adds a request in the pool"""
+        if request.kv_cache is None and request.use_cache:
+            request.kv_cache = Cache(n_layers=self.num_layers)
         self.pool.put(request)
 
     def sample(self, logits):
         """select the next token greedily via argmax"""
         return torch.argmax(logits, dim=-1, keepdim=True)
-    
-    def _forward_pass(self, tokens, caches, cache_positions, pad_lengths=None):
-        """does one forward pass of the model and returns the next token"""
+
+    def _gather_caches(self, requests: List[Request]):
+        """Stack per-request caches into batched, right-padded tensors (one per layer).
+
+        Returns (prev_k_list, prev_v_list, cache_lens) or (None, None, None) when no
+        request has any cached K/V yet (pure prefill).
+        """
+        batch_size = len(requests)
+        cache_lens_py = []
+        ref_k = None
+        for r in requests:
+            cache = r.kv_cache
+            c = cache.get(0) if cache is not None else None
+            if c is not None:
+                cache_lens_py.append(c[0].shape[2])
+                if ref_k is None:
+                    ref_k = c[0]
+            else:
+                cache_lens_py.append(0)
+
+        if ref_k is None:
+            return None, None, None
+
+        max_cache_len = max(cache_lens_py)
+        _, H_kv, _, D = ref_k.shape
+        dtype = ref_k.dtype
+        dev = ref_k.device
+
+        prev_k_list = []
+        prev_v_list = []
+        for layer_idx in range(self.num_layers):
+            k_batch = torch.zeros(batch_size, H_kv, max_cache_len, D, dtype=dtype, device=dev)
+            v_batch = torch.zeros(batch_size, H_kv, max_cache_len, D, dtype=dtype, device=dev)
+            for i, r in enumerate(requests):
+                c = r.kv_cache.get(layer_idx) if r.kv_cache is not None else None
+                if c is not None:
+                    k_i, v_i = c  # (1, H_kv, L_i, D)
+                    L_i = k_i.shape[2]
+                    k_batch[i, :, :L_i] = k_i.squeeze(0)
+                    v_batch[i, :, :L_i] = v_i.squeeze(0)
+            prev_k_list.append(k_batch)
+            prev_v_list.append(v_batch)
+
+        cache_lens = torch.tensor(cache_lens_py, dtype=torch.long, device=dev)
+        return prev_k_list, prev_v_list, cache_lens
+
+    def _scatter_caches(self, requests: List[Request], new_k_list, new_v_list,
+                        L_prev: int, num_tokens: int, pad_lengths_py: List[int] | None = None):
+        """Split updated batched caches back into per-request Cache storage.
+
+        For each request i, extract the concatenation of:
+          - cache-region valid part:  cols [0, old_L_i)
+          - new-region real tokens:   cols [L_prev + pl_i, L_prev + num_tokens)
+        and store the compacted (1, H_kv, old_L_i + num_tokens - pl_i, D) back into the Cache.
+        """
+        for i, r in enumerate(requests):
+            if r.kv_cache is None or not r.use_cache:
+                continue
+            old_L = r.cache_pos
+            pl = pad_lengths_py[i] if pad_lengths_py is not None else 0
+            for layer_idx in range(self.num_layers):
+                full_k = new_k_list[layer_idx][i:i+1]
+                full_v = new_v_list[layer_idx][i:i+1]
+                k_old = full_k[:, :, :old_L, :]
+                v_old = full_v[:, :, :old_L, :]
+                k_new = full_k[:, :, L_prev + pl : L_prev + num_tokens, :]
+                v_new = full_v[:, :, L_prev + pl : L_prev + num_tokens, :]
+                r.kv_cache.update(
+                    layer_idx,
+                    (torch.cat([k_old, k_new], dim=2), torch.cat([v_old, v_new], dim=2)),
+                )
+
+    def _forward_pass(self, tokens, requests: List[Request], pad_lengths_py=None):
+        """One model forward pass over a batch of requests. Returns last-token logits (B, V)."""
+        prev_k_list, prev_v_list, cache_lens = self._gather_caches(requests)
+        L_prev = prev_k_list[0].shape[2] if prev_k_list is not None else 0
+        T = tokens.shape[1]
+
+        pad_lengths_tensor = None
+        if pad_lengths_py is not None:
+            pad_lengths_tensor = torch.tensor(pad_lengths_py, dtype=torch.long, device=tokens.device)
+
         with torch.no_grad():
-            logits = self.model(tokens, caches=caches, start_positions=cache_positions, pad_lengths=pad_lengths)
+            logits, new_k_list, new_v_list = self.model(
+                tokens,
+                prev_k_list=prev_k_list,
+                prev_v_list=prev_v_list,
+                cache_lens=cache_lens,
+                pad_lengths=pad_lengths_tensor,
+            )
+
+        self._scatter_caches(requests, new_k_list, new_v_list, L_prev, T, pad_lengths_py=pad_lengths_py)
         return logits[:, -1, :]
 
     def prefill_batch(self, requests: List[Request]):
         """batched prefill for multiple requests in a single forward pass"""
-
         all_tokens = [self.tokenizer.encode(r.prompt) for r in requests]
         max_len = max(len(t) for t in all_tokens)
 
         pad_id = self.tokenizer.pad_token_id or 0
         padded = [([pad_id] * (max_len - len(t))) + t for t in all_tokens]
-        pad_lengths = [max_len - len(t) for t in all_tokens]
-        tokens = torch.tensor(padded, device=device)  # (B, max_len)
+        pad_lengths_py = [max_len - len(t) for t in all_tokens]
+        tokens = torch.tensor(padded, device=device)
 
-        caches = [r.kv_cache if r.use_cache else None for r in requests]
-        start_positions = [0] * len(requests)
-
-        logits = self._forward_pass(tokens, caches, start_positions, pad_lengths=pad_lengths)
-        next_tokens = self.sample(logits)  # (B, 1)
+        last_logits = self._forward_pass(tokens, requests, pad_lengths_py=pad_lengths_py)
+        next_tokens = self.sample(last_logits)
 
         for i, request in enumerate(requests):
             request.prompt_tokens = all_tokens[i]
             request.tokens.append(next_tokens[i].item())
-
-            actual_len = len(all_tokens[i])
-            pl = pad_lengths[i]
-
-            # Trim pad-token entries from the KV cache so decode
-            # starts with clean positional state
-            if pl > 0 and request.use_cache:
-                for layer_idx in range(self.num_layers):
-                    cached = request.kv_cache.get(layer_idx)
-                    if cached is not None:
-                        k, v = cached
-                        request.kv_cache.update(layer_idx, (k[:, :, pl:, :], v[:, :, pl:, :]))
-
-            request.cache_pos = actual_len
+            request.cache_pos = len(all_tokens[i])
             request.is_prefill = False
 
     def decode_batch(self, requests: List[Request]):
-        """the decode step for a batch of requests in a single forward pass."""
-        # stack the last token of each request: (B, 1)
+        """single-step decode for a batch of requests in a single forward pass"""
         tokens = torch.tensor([[r.tokens[-1]] for r in requests], device=device)
-        caches = [r.kv_cache for r in requests]  
-        start_positions = [r.cache_pos for r in requests]
 
-        logits = self._forward_pass(tokens, caches, start_positions)
-        next_tokens = self.sample(logits)
+        last_logits = self._forward_pass(tokens, requests, pad_lengths_py=None)
+        next_tokens = self.sample(last_logits)
 
         for i, request in enumerate(requests):
             request.cache_pos += 1
@@ -112,22 +185,19 @@ class Engine:
             request.tokens.append(tok)
             if tok == self.tokenizer.eos_token_id or len(request.tokens) >= request.max_tokens:
                 request.is_completed = True
-                request.response = self.tokenizer.decode(request.tokens)
+                request.response = self.tokenizer.decode(request.tokens, skip_special_tokens=True)
 
     def _get_next_batch(self):
-        self.current_batch = [_req for _req in self.current_batch if not _req.is_completed]  # in the current
-
-
+        self.current_batch = [r for r in self.current_batch if not r.is_completed]
         while not self.pool.empty() and len(self.current_batch) < MAX_BATCH_SIZE:
             self.current_batch.append(self.pool.get())
-
         return self.current_batch
 
     def generate(self):
         self.current_batch = self._get_next_batch()
         if not self.current_batch:
             return False
- 
+
         prefill_requests = [r for r in self.current_batch if r.is_prefill]
         decode_requests  = [r for r in self.current_batch if not r.is_prefill]
 
@@ -135,31 +205,30 @@ class Engine:
             chunk = prefill_requests[i : i + MAX_PREFILL_BATCH]
             self.prefill_batch(chunk)
 
-
         if decode_requests:
             self.decode_batch(decode_requests)
- 
+
         return True
-    
+
     def generate_text(self, prompts: Union[str, List[str]], max_tokens: int = 100):
         """the public api for generation"""
         if isinstance(prompts, str):
             prompts = [prompts]
-        
+
         requests = []
         for prompt in prompts:
             req = Request(id=self.request_id, prompt=prompt, max_tokens=max_tokens)
             self.request_id += 1
             self.add_request(req)
             requests.append(req)
-        
 
         while self.generate():
             pass
 
         return requests[0] if len(requests) == 1 else requests
-        
+
 
 if __name__ == "__main__":
     engine = Engine("Qwen/Qwen3-4B")
-    print(engine.generate_text("Explain AGI"))
+    result = engine.generate_text("Explain AGI")
+    print(result.response)

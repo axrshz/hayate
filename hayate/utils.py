@@ -6,14 +6,6 @@ from safetensors import safe_open
 from huggingface_hub import snapshot_download
 
 
-def pad_to(t, length):
-    """pad from the last dimension in pairs of 2"""
-    pad = length - t.shape[2]
-    if pad == 0:
-        return t
-    return torch.nn.functional.pad(t, (0, 0, 0, pad))
-
-
 def download_weights(repo_id: str, local_dir: str):
     """download model weights from huggingface if not already present locally"""
     if os.path.isdir(local_dir) and glob(os.path.join(local_dir, "*.safetensors")):

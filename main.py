@@ -1,13 +1,13 @@
 from hayate.engine.engine import Engine
 
 engine = Engine("Qwen/Qwen3-4B")
-print(engine.generate_text("Explain AGI"))
+print(engine.generate_text("Explain AGI").response)
 
 outputs = engine.generate_text([
     "Explain AGI",
     "What is vLLM?",
-    "Tell me about SGLang"
+    "Tell me about SGLang",
 ])
 
 for o in outputs:
-    print(o)
+    print(o.response)

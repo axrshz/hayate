@@ -1,5 +1,3 @@
-from typing import List, Optional
-
 import torch
 import torch.nn as nn
 
@@ -23,6 +21,8 @@ class Qwen3Model(nn.Module):
         max_position_embeddings = 40_960
 
         self.num_layers = num_layers
+        self.num_kv_groups = num_kv_groups
+        self.head_dim = head_dim
 
         self.embed_tokens = nn.Embedding(vocab_size, hidden_size, dtype=torch.bfloat16)
         self.layers = nn.ModuleList([
@@ -43,49 +43,77 @@ class Qwen3Model(nn.Module):
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
 
-    def forward(self, token_ids, caches, start_positions, pad_lengths=None):
-        batch_size, num_tokens = token_ids.shape
+    def forward(self, token_ids, prev_k_list=None, prev_v_list=None,
+                cache_lens=None, pad_lengths=None):
+        """
+        token_ids:    (B, T) int64
+        prev_k_list,
+        prev_v_list:  optional list[num_layers] of (B, H_kv, L_prev, D) batched prior caches;
+                      None on fresh prefill.
+        cache_lens:   optional (B,) int64 tensor of per-request valid cache length
+                      (values in [0, L_prev]); required when prev_k_list is not None.
+        pad_lengths:  optional (B,) int64 tensor of per-request left-pad lengths in the
+                      new-token region; only used during padded prefill.
+
+        Returns: logits (B, T, V), new_k_list, new_v_list (each (B, H_kv, L_prev+T, D)).
+        """
+        B, T = token_ids.shape
         x = self.embed_tokens(token_ids)
 
-        # Build position_ids: (B, num_tokens) with correct absolute positions
-        positions = torch.arange(num_tokens, device=x.device, dtype=torch.long).unsqueeze(0)
-        sp_tensor = torch.tensor(start_positions, device=x.device, dtype=torch.long).unsqueeze(1)
-        position_ids = positions + sp_tensor  # (B, num_tokens)
+        L_prev = prev_k_list[0].shape[2] if prev_k_list is not None else 0
+        L_full = L_prev + T
+
+        arange_t = torch.arange(T, device=x.device, dtype=torch.long).unsqueeze(0)  # (1, T)
+
+        if cache_lens is not None:
+            cl_1d = cache_lens.view(-1, 1)  # (B, 1)
+        else:
+            cl_1d = torch.zeros(B, 1, device=x.device, dtype=torch.long)
 
         if pad_lengths is not None:
-            position_ids = position_ids.clone()
-            for i, pl in enumerate(pad_lengths):
-                if pl > 0:
-                    position_ids[i, :pl] = 0
-                    position_ids[i, pl:] = torch.arange(num_tokens - pl, device=x.device)
+            pl_1d = pad_lengths.view(-1, 1)  # (B, 1)
+            position_ids = (arange_t + cl_1d - pl_1d).clamp(min=0)
+        else:
+            position_ids = arange_t + cl_1d  # broadcasts to (B, T)
 
-        # Causal mask
-        max_seq = max(start_positions) + num_tokens
-        full_mask = torch.triu(
-            torch.ones(max_seq, max_seq, device=x.device, dtype=torch.bool),
-            diagonal=1
-        )
+        # Attention mask over the concatenated [cache | new] tensor of length L_full.
+        # mask[b, r, j] = True means key j is invalid for query at row r of request b.
+        k_pos = torch.arange(L_full, device=x.device, dtype=torch.long).view(1, 1, -1)  # (1, 1, L_full)
+        q_col = (L_prev + arange_t).unsqueeze(-1)                                       # (1, T, 1)
 
-        mask_rows = []
-        for i, sp in enumerate(start_positions):
-            row = full_mask[sp : sp + num_tokens, :max_seq]
-            mask_rows.append(row)
-        mask = torch.stack(mask_rows, dim=0).unsqueeze(1)
+        # Causal mask: within the new-token region, row r at column L_prev+r can only
+        # attend to columns <= L_prev+r; cache-region columns (< L_prev) are never
+        # causal-violated by this definition.
+        mask = k_pos > q_col  # (1, T, L_full)
 
-        # Block real tokens from attending to left-pad positions
+        if L_prev > 0:
+            # Cache-region padding: columns [cache_lens[b], L_prev) are zero-padded and invalid.
+            cl_mask = cache_lens.view(-1, 1, 1)  # (B, 1, 1)
+            mask_cache_pad = (k_pos < L_prev) & (k_pos >= cl_mask)  # (B, 1, L_full)
+            mask = mask | mask_cache_pad
+
         if pad_lengths is not None:
-            for i, pl in enumerate(pad_lengths):
-                if pl > 0:
-                    mask[i, :, pl:, :pl] = True
+            # New-region left-padding: columns [L_prev, L_prev+pl[b]) in the new region are
+            # pad tokens; real queries must not attend to them. Pad queries (row r < pl[b])
+            # intentionally keep their causal prefix unmasked so their attention output is
+            # finite — their logits are discarded downstream anyway.
+            pl_mask = pad_lengths.view(-1, 1, 1)  # (B, 1, 1)
+            real_row = arange_t.unsqueeze(-1) >= pl_mask  # (B, T, 1)
+            col_is_new_pad = (k_pos >= L_prev) & ((k_pos - L_prev) < pl_mask)  # (B, 1, L_full)
+            mask = mask | (col_is_new_pad & real_row)
 
+        mask = mask.unsqueeze(1)  # (B, 1, T, L_full)
+        attn_mask = torch.zeros_like(mask, dtype=x.dtype).masked_fill(mask, float("-inf"))
+
+        new_k_list = []
+        new_v_list = []
         for layer_idx, block in enumerate(self.layers):
-            layer_caches = [(c.get(layer_idx) if c is not None else None) for c in caches]
-            x, new_layer_caches = block(x, mask, self.cos, self.sin, position_ids, layer_caches)
-
-            for i, c in enumerate(caches):
-                if c is not None:
-                    c.update(layer_idx, new_layer_caches[i])
+            pk = prev_k_list[layer_idx] if prev_k_list is not None else None
+            pv = prev_v_list[layer_idx] if prev_v_list is not None else None
+            x, nk, nv = block(x, attn_mask, self.cos, self.sin, position_ids, pk, pv)
+            new_k_list.append(nk)
+            new_v_list.append(nv)
 
         x = self.norm(x)
-        logits = self.out_head(x.to(torch.bfloat16))
-        return logits
+        logits = self.out_head(x)
+        return logits, new_k_list, new_v_list
