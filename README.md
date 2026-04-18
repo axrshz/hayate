@@ -15,10 +15,16 @@ uv pip install -e .
 
 ## Run
 
-Run the benchmark with the default non-verbose output:
+Run the benchmark:
 
 ```bash
 python benchmark.py 10
+```
+
+Compile the model before benchmarking:
+
+```bash
+python benchmark.py 10 --compile
 ```
 
 Use `--verbose` if you want the detailed per-mode breakdown:
@@ -27,34 +33,14 @@ Use `--verbose` if you want the detailed per-mode breakdown:
 python benchmark.py 10 --verbose
 ```
 
+`torch.compile` has a noticeable upfront cost on the first run, but later generations can be faster.
+
 ## Benchmark
 
-benchmarks on an `NVIDIA A40 (47.7GB)`:
-
-```text
-============================================================
-  Workload
-============================================================
-
-  model:                Qwen/Qwen3-4B
-  device:               NVIDIA A40 (47.7GB)
-  seed:                 1337
-  requests:             10
-  repetitions:          5
-  arrival gap (ms):     25.0
-  prompt tokens (min):  175
-  prompt tokens (mean): 225.0
-  prompt tokens (max):  322
-  max_tokens/request:   256
-
-============================================================
-  Benchmark Summary
-============================================================
-
-  mode                       mean        p50        p95  total tok/s
-  -------------------- ---------- ---------- ---------- ------------
-  single request           8.237s     8.218s     8.540s       58.39
-  continous batching      17.361s    17.353s    17.596s      273.31
+```bash
+python benchmark.py 10
+python benchmark.py 10 --compile
+python benchmark.py 10 --prompt-tokens 224 --max-tokens 256 --verbose
 ```
 
 ## Todo
@@ -63,7 +49,7 @@ benchmarks on an `NVIDIA A40 (47.7GB)`:
 - [x] kv caching
 - [x] greedy decoding
 - [x] continuous batching
-- [ ] torch.compile
+- [x] torch.compile
 - [ ] paged attention
 - [ ] turboquant kv cache
 - [ ] custom kernels

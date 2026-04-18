@@ -33,11 +33,13 @@ class Request:
 
 
 class Engine:
-    def __init__(self, model_name: str):
+    def __init__(self, model_name: str, compile_model: bool = False):
         self.model = Qwen3Model()
         self.num_layers = self.model.num_layers
         load_weights(self.model, model_name)
         self.model = self.model.to(device)
+        if compile_model:
+            self.model = torch.compile(self.model)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
         self.pool = Queue()
         self.current_batch = []
