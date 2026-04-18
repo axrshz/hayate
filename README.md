@@ -1,6 +1,6 @@
 # hayate
 
-Inference engine for `Qwen/Qwen3-4B`. WIP.
+Inference engine for Qwen3-4B. WIP.
 
 ## Setup
 
