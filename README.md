@@ -9,7 +9,6 @@ Inference engine for `Qwen/Qwen3-4B`. WIP.
 ```bash
 uv venv
 source .venv/bin/activate
-uv pip install -U pip
 uv pip install -e .
 ```
 
