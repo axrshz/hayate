@@ -43,24 +43,24 @@ class Qwen3Model(nn.Module):
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
 
-    def forward(self, token_ids, prev_k_list=None, prev_v_list=None,
+    def forward(self, token_ids, prev_k=None, prev_v=None,
                 cache_lens=None, pad_lengths=None):
         """
         token_ids:    (B, T) int64
-        prev_k_list,
-        prev_v_list:  optional list[num_layers] of (B, H_kv, L_prev, D) batched prior caches;
+        prev_k,
+        prev_v:       optional (num_layers, B, H_kv, L_prev, D) stacked prior caches;
                       None on fresh prefill.
         cache_lens:   optional (B,) int64 tensor of per-request valid cache length
-                      (values in [0, L_prev]); required when prev_k_list is not None.
+                      (values in [0, L_prev]); required when prev_k is not None.
         pad_lengths:  optional (B,) int64 tensor of per-request left-pad lengths in the
                       new-token region; only used during padded prefill.
 
-        Returns: logits (B, T, V), new_k_list, new_v_list (each (B, H_kv, L_prev+T, D)).
+        Returns: logits (B, T, V), new_k, new_v (each (num_layers, B, H_kv, L_prev+T, D)).
         """
         B, T = token_ids.shape
         x = self.embed_tokens(token_ids)
 
-        L_prev = prev_k_list[0].shape[2] if prev_k_list is not None else 0
+        L_prev = prev_k.shape[3] if prev_k is not None else 0
         L_full = L_prev + T
 
         arange_t = torch.arange(T, device=x.device, dtype=torch.long).unsqueeze(0)  # (1, T)
@@ -108,12 +108,17 @@ class Qwen3Model(nn.Module):
         new_k_list = []
         new_v_list = []
         for layer_idx, block in enumerate(self.layers):
-            pk = prev_k_list[layer_idx] if prev_k_list is not None else None
-            pv = prev_v_list[layer_idx] if prev_v_list is not None else None
+            pk = prev_k[layer_idx] if prev_k is not None else None
+            pv = prev_v[layer_idx] if prev_v is not None else None
             x, nk, nv = block(x, attn_mask, self.cos, self.sin, position_ids, pk, pv)
             new_k_list.append(nk)
             new_v_list.append(nv)
 
+        # Consolidate per-layer outputs into a single stacked tensor so the engine
+        # scatter can slice per-request in O(B) Python ops instead of O(B × num_layers).
+        new_k = torch.stack(new_k_list, dim=0)
+        new_v = torch.stack(new_v_list, dim=0)
+
         x = self.norm(x)
         logits = self.out_head(x)
-        return logits, new_k_list, new_v_list
+        return logits, new_k, new_v

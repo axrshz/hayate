@@ -53,7 +53,7 @@ class Engine:
     def add_request(self, request: Request):
         """adds a request in the pool"""
         if request.kv_cache is None and request.use_cache:
-            request.kv_cache = Cache(n_layers=self.num_layers)
+            request.kv_cache = Cache()
         self.pool.put(request)
 
     def sample(self, logits):
@@ -61,80 +61,72 @@ class Engine:
         return torch.argmax(logits, dim=-1, keepdim=True)
 
     def _gather_caches(self, requests: List[Request]):
-        """Stack per-request caches into batched, right-padded tensors (one per layer).
+        """Stack per-request caches into a single batched, right-padded tensor.
 
-        Returns (prev_k_list, prev_v_list, cache_lens) or (None, None, None) when no
-        request has any cached K/V yet (pure prefill).
+        Returns (prev_k, prev_v, cache_lens) where prev_k/prev_v have shape
+        (num_layers, B, H_kv, L_max, D), or (None, None, None) when no request has
+        any cached K/V yet (pure prefill).
         """
         batch_size = len(requests)
-        cache_lens_py = []
-        ref_k = None
+        cache_lens_py: List[int] = []
+        ref: torch.Tensor | None = None
         for r in requests:
             cache = r.kv_cache
-            c = cache.get(0) if cache is not None else None
-            if c is not None:
-                cache_lens_py.append(c[0].shape[2])
-                if ref_k is None:
-                    ref_k = c[0]
+            if cache is not None and cache.k is not None:
+                cache_lens_py.append(cache.k.shape[2])
+                if ref is None:
+                    ref = cache.k
             else:
                 cache_lens_py.append(0)
 
-        if ref_k is None:
+        if ref is None:
             return None, None, None
 
         max_cache_len = max(cache_lens_py)
-        _, H_kv, _, D = ref_k.shape
-        dtype = ref_k.dtype
-        dev = ref_k.device
+        _, H_kv, _, D = ref.shape
+        dtype, dev = ref.dtype, ref.device
 
-        prev_k_list = []
-        prev_v_list = []
-        for layer_idx in range(self.num_layers):
-            k_batch = torch.zeros(batch_size, H_kv, max_cache_len, D, dtype=dtype, device=dev)
-            v_batch = torch.zeros(batch_size, H_kv, max_cache_len, D, dtype=dtype, device=dev)
-            for i, r in enumerate(requests):
-                c = r.kv_cache.get(layer_idx) if r.kv_cache is not None else None
-                if c is not None:
-                    k_i, v_i = c  # (1, H_kv, L_i, D)
-                    L_i = k_i.shape[2]
-                    k_batch[i, :, :L_i] = k_i.squeeze(0)
-                    v_batch[i, :, :L_i] = v_i.squeeze(0)
-            prev_k_list.append(k_batch)
-            prev_v_list.append(v_batch)
+        prev_k = torch.zeros(self.num_layers, batch_size, H_kv, max_cache_len, D, dtype=dtype, device=dev)
+        prev_v = torch.zeros(self.num_layers, batch_size, H_kv, max_cache_len, D, dtype=dtype, device=dev)
+
+        for i, r in enumerate(requests):
+            L_i = cache_lens_py[i]
+            if L_i > 0 and r.kv_cache is not None and r.kv_cache.k is not None:
+                prev_k[:, i, :, :L_i, :] = r.kv_cache.k
+                prev_v[:, i, :, :L_i, :] = r.kv_cache.v
 
         cache_lens = torch.tensor(cache_lens_py, dtype=torch.long, device=dev)
-        return prev_k_list, prev_v_list, cache_lens
+        return prev_k, prev_v, cache_lens
 
-    def _scatter_caches(self, requests: List[Request], new_k_list, new_v_list,
+    def _scatter_caches(self, requests: List[Request], new_k, new_v,
                         L_prev: int, num_tokens: int, pad_lengths_py: List[int] | None = None):
         """Split updated batched caches back into per-request Cache storage.
 
-        For each request i, extract the concatenation of:
+        new_k, new_v: (num_layers, B, H_kv, L_prev + T, D) stacked model outputs.
+
+        For each request i, form the compacted cache by concatenating:
           - cache-region valid part:  cols [0, old_L_i)
-          - new-region real tokens:   cols [L_prev + pl_i, L_prev + num_tokens)
-        and store the compacted (1, H_kv, old_L_i + num_tokens - pl_i, D) back into the Cache.
+          - new-region real tokens:   cols [L_prev + pl_i, L_prev + T)
+        into a single (num_layers, H_kv, old_L_i + T - pl_i, D) tensor.
         """
         for i, r in enumerate(requests):
             if r.kv_cache is None or not r.use_cache:
                 continue
             old_L = r.cache_pos
             pl = pad_lengths_py[i] if pad_lengths_py is not None else 0
-            for layer_idx in range(self.num_layers):
-                full_k = new_k_list[layer_idx][i:i+1]
-                full_v = new_v_list[layer_idx][i:i+1]
-                k_old = full_k[:, :, :old_L, :]
-                v_old = full_v[:, :, :old_L, :]
-                k_new = full_k[:, :, L_prev + pl : L_prev + num_tokens, :]
-                v_new = full_v[:, :, L_prev + pl : L_prev + num_tokens, :]
-                r.kv_cache.update(
-                    layer_idx,
-                    (torch.cat([k_old, k_new], dim=2), torch.cat([v_old, v_new], dim=2)),
-                )
+
+            k_old = new_k[:, i, :, :old_L, :]
+            v_old = new_v[:, i, :, :old_L, :]
+            k_new = new_k[:, i, :, L_prev + pl : L_prev + num_tokens, :]
+            v_new = new_v[:, i, :, L_prev + pl : L_prev + num_tokens, :]
+
+            r.kv_cache.k = torch.cat([k_old, k_new], dim=2)
+            r.kv_cache.v = torch.cat([v_old, v_new], dim=2)
 
     def _forward_pass(self, tokens, requests: List[Request], pad_lengths_py=None):
         """One model forward pass over a batch of requests. Returns last-token logits (B, V)."""
-        prev_k_list, prev_v_list, cache_lens = self._gather_caches(requests)
-        L_prev = prev_k_list[0].shape[2] if prev_k_list is not None else 0
+        prev_k, prev_v, cache_lens = self._gather_caches(requests)
+        L_prev = prev_k.shape[3] if prev_k is not None else 0
         T = tokens.shape[1]
 
         pad_lengths_tensor = None
@@ -142,15 +134,15 @@ class Engine:
             pad_lengths_tensor = torch.tensor(pad_lengths_py, dtype=torch.long, device=tokens.device)
 
         with torch.no_grad():
-            logits, new_k_list, new_v_list = self.model(
+            logits, new_k, new_v = self.model(
                 tokens,
-                prev_k_list=prev_k_list,
-                prev_v_list=prev_v_list,
+                prev_k=prev_k,
+                prev_v=prev_v,
                 cache_lens=cache_lens,
                 pad_lengths=pad_lengths_tensor,
             )
 
-        self._scatter_caches(requests, new_k_list, new_v_list, L_prev, T, pad_lengths_py=pad_lengths_py)
+        self._scatter_caches(requests, new_k, new_v, L_prev, T, pad_lengths_py=pad_lengths_py)
         return logits[:, -1, :]
 
     def prefill_batch(self, requests: List[Request]):

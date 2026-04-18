@@ -1,16 +1,26 @@
+from __future__ import annotations
+
+import torch
+
+
 class Cache:
-    def __init__(self, n_layers):
-        self.cache = [None] * n_layers # a better data structure?
-    
-    def get(self, layer_idx = 0):
-        return self.cache[layer_idx]
-    
-    def update(self, layer_idx, value):
-        self.cache[layer_idx] = value
+    """Per-request KV cache stored as a single stacked tensor across layers.
 
-    def get_all(self):
-        return self.cache
+    Layout: k, v each have shape (num_layers, H_kv, L, D).
+    Storing all layers together keeps gather/scatter at the engine level at O(B)
+    Python→CUDA calls per forward instead of O(num_layers × B).
+    """
 
-    def reset(self):
-        for i in range(len(self.cache)):
-            self.cache[i] = None
+    __slots__ = ("k", "v")
+
+    def __init__(self):
+        self.k: torch.Tensor | None = None
+        self.v: torch.Tensor | None = None
+
+    @property
+    def length(self) -> int:
+        return 0 if self.k is None else self.k.shape[2]
+
+    def reset(self) -> None:
+        self.k = None
+        self.v = None
