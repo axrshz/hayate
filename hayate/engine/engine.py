@@ -70,6 +70,13 @@ class Engine:
         """select the next token greedily via argmax"""
         return torch.argmax(logits, dim=-1, keepdim=True)
 
+    def _finalize_generated_token(self, request: Request, tok: int):
+        """Append a sampled token and complete the request if it hit a stop condition."""
+        request.tokens.append(tok)
+        if tok == self.tokenizer.eos_token_id or len(request.tokens) >= request.max_tokens:
+            request.is_completed = True
+            request.response = self.tokenizer.decode(request.tokens, skip_special_tokens=True)
+
     def _gather_caches(self, requests: List[Request]):
         """Stack per-request caches into a single batched, right-padded tensor.
 
@@ -170,7 +177,7 @@ class Engine:
 
         for i, request in enumerate(requests):
             request.prompt_tokens = all_tokens[i]
-            request.tokens.append(next_tokens[i].item())
+            self._finalize_generated_token(request, next_tokens[i].item())
             request.cache_pos = len(all_tokens[i])
             request.is_prefill = False
 
@@ -184,10 +191,7 @@ class Engine:
         for i, request in enumerate(requests):
             request.cache_pos += 1
             tok = next_tokens[i].item()
-            request.tokens.append(tok)
-            if tok == self.tokenizer.eos_token_id or len(request.tokens) >= request.max_tokens:
-                request.is_completed = True
-                request.response = self.tokenizer.decode(request.tokens, skip_special_tokens=True)
+            self._finalize_generated_token(request, tok)
 
     def _get_next_batch(self):
         self.current_batch = [r for r in self.current_batch if not r.is_completed]
