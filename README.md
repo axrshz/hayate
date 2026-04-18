@@ -66,6 +66,7 @@ staggered arrivals      13.003s    12.882s    13.639s      364.56
 - [x] greedy decoding
 - [x] continuous batching
 - [x] torch.compile
+- [ ] pytorch fused sdpa
 - [ ] paged attention
 - [ ] turboquant kv cache
 - [ ] custom kernels
