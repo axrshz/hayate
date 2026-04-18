@@ -41,10 +41,20 @@ class Engine:
         load_weights(self.model, model_name)
         self.model = self.model.to(device)
         if compile:
-            # dynamic=True tells Dynamo to treat varying (B, T, L_prev) as symbolic,
-            # avoiding a recompile per unique shape combo. First forward still pays
-            # a multi-minute trace/compile cost.
-            self.model = torch.compile(self.model, dynamic=True)
+            # dynamic=True: Dynamo treats (B, T, L_prev) as symbolic, so we compile the
+            # Inductor graph exactly once instead of per shape combo.
+            # mode="reduce-overhead": Inductor captures a CUDA graph per unique runtime
+            # shape on first encounter, then replays it on subsequent calls. This removes
+            # per-kernel launch overhead on the hot path — a big win for decode where the
+            # batch is small and kernels are short. Trade-offs:
+            #   - First call at each new (B, T, L_prev) pays a capture cost (cheap vs the
+            #     initial Dynamo trace, but nonzero). Decode's L_prev grows by 1 per step,
+            #     so expect ~max_tokens captures before steady state.
+            #   - Extra GPU memory for static I/O buffers and the graph pool.
+            #   - Outputs are backed by a graph-owned buffer and are overwritten on the
+            #     next forward. We consume them (sample + scatter's torch.cat) before the
+            #     next call, so this is safe for our flow.
+            self.model = torch.compile(self.model, dynamic=True, mode="reduce-overhead")
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
         self.pool: Queue = Queue()
         self.current_batch: List[Request] = []
