@@ -35,6 +35,39 @@ calls are fast.
 python benchmark.py 10 --compile
 ```
 
+PyTorch SDPA backend selection is exposed through `Engine` and the benchmark. The
+default `auto` mode lets PyTorch pick the best available kernel; use `flash`,
+`efficient`, or `math` to force a backend for GPU experiments:
+
+```bash
+python benchmark.py 10 --sdpa-backend efficient
+```
+
+Forced fused backends can fail if the active PyTorch/CUDA build does not support the
+current mask, dtype, GQA, or sequence shape. Use `auto` for the safest dispatch path.
+
+Prefix caching is available as an opt-in engine feature for workloads where prompts
+share token prefixes:
+
+```python
+from hayate.engine.engine import Engine
+
+engine = Engine("Qwen/Qwen3-4B", enable_prefix_cache=True)
+```
+
+The cache stores reusable prompt KV prefixes with a token budget. The default budget
+is 4096 cached prefix tokens; pass `prefix_cache_max_tokens=...` to tune VRAM usage.
+
+To benchmark prefix caching, run the benchmark with a generated shared-prefix
+workload:
+
+```bash
+python benchmark.py 10 --prefix-cache
+```
+
+Tune the synthetic workload with `--prefix-shared-tokens`,
+`--prefix-suffix-tokens`, and `--prefix-cache-max-tokens`.
+
 ## Benchmark
 
 `Qwen/Qwen3-4B` on an `NVIDIA A40 (47.7GB)`, 10 requests, 5 reps.
@@ -66,8 +99,8 @@ staggered arrivals      13.003s    12.882s    13.639s      364.56
 - [x] greedy decoding
 - [x] continuous batching
 - [x] torch.compile
-- [ ] pytorch fused sdpa
-- [ ] prefix caching
+- [x] prefix caching
+- [x] pytorch fused sdpa
 - [ ] paged attention
 - [ ] turboquant kv cache
 - [ ] custom kernels

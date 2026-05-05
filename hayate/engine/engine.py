@@ -7,12 +7,15 @@ from queue import Queue
 from hayate.model import Qwen3Model
 from hayate.utils import load_weights
 from hayate.model.cache import Cache
+from hayate.engine.prefix_cache import PrefixCache
+from hayate.model.attention import SDPA_BACKENDS
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 MAX_BATCH_SIZE = 20
 MAX_DECODE_BATCH = 20
 MAX_PREFILL_BATCH = 8
+DEFAULT_PREFIX_CACHE_MAX_TOKENS = 4096
 
 @dataclass
 class Request:
@@ -25,6 +28,7 @@ class Request:
     kv_cache: Cache | None = None
 
     cache_pos: int = 0
+    prefix_cache_len: int = 0
     is_completed: bool = False
     is_prefill: bool = True
     use_cache: bool = True
@@ -33,8 +37,18 @@ class Request:
 
 
 class Engine:
-    def __init__(self, model_name: str, compile: bool = False):
-        self.model = Qwen3Model()
+    def __init__(
+        self,
+        model_name: str,
+        compile: bool = False,
+        enable_prefix_cache: bool = False,
+        prefix_cache_max_tokens: int = DEFAULT_PREFIX_CACHE_MAX_TOKENS,
+        sdpa_backend: str = "auto",
+    ):
+        if sdpa_backend not in SDPA_BACKENDS:
+            raise ValueError(f"unknown SDPA backend '{sdpa_backend}'. Valid options: {SDPA_BACKENDS}")
+
+        self.model = Qwen3Model(sdpa_backend=sdpa_backend)
         self.num_layers = self.model.num_layers
         self.num_kv_groups = self.model.num_kv_groups
         self.head_dim = self.model.head_dim
@@ -59,12 +73,51 @@ class Engine:
         self.pool: Queue = Queue()
         self.current_batch: List[Request] = []
         self.request_id = 0
+        self.prefix_cache = PrefixCache(prefix_cache_max_tokens) if enable_prefix_cache else None
 
     def add_request(self, request: Request):
         """adds a request in the pool"""
-        if request.kv_cache is None and request.use_cache:
-            request.kv_cache = Cache()
+        self._prepare_request(request)
         self.pool.put(request)
+
+    def _prepare_request(self, request: Request):
+        """Tokenize and seed the request with the longest reusable prompt prefix."""
+        if not request.prompt_tokens:
+            request.prompt_tokens = self.tokenizer.encode(request.prompt)
+
+        if not request.use_cache:
+            return
+
+        if request.kv_cache is not None and request.kv_cache.length > 0:
+            request.cache_pos = request.kv_cache.length
+            request.prefix_cache_len = request.cache_pos
+            return
+
+        request.kv_cache = Cache()
+        if self.prefix_cache is None:
+            return
+
+        # Keep at least one prompt token for prefill so we can compute next-token logits.
+        max_prefix_len = max(len(request.prompt_tokens) - 1, 0)
+        match = self.prefix_cache.get(request.prompt_tokens, max_prefix_len=max_prefix_len)
+        if match.cache is None or match.length == 0:
+            return
+
+        request.kv_cache = match.cache
+        request.cache_pos = match.length
+        request.prefix_cache_len = match.length
+
+    def clear_prefix_cache(self):
+        """Drop all cached prompt prefixes."""
+        if self.prefix_cache is not None:
+            self.prefix_cache.clear()
+
+    def _store_prompt_prefix(self, request: Request):
+        if self.prefix_cache is None or not request.use_cache or request.kv_cache is None:
+            return
+        if not request.prompt_tokens or request.kv_cache.length < len(request.prompt_tokens):
+            return
+        self.prefix_cache.put(request.prompt_tokens, request.kv_cache)
 
     def sample(self, logits):
         """select the next token greedily via argmax"""
@@ -164,12 +217,31 @@ class Engine:
 
     def prefill_batch(self, requests: List[Request]):
         """batched prefill for multiple requests in a single forward pass"""
-        all_tokens = [self.tokenizer.encode(r.prompt) for r in requests]
-        max_len = max(len(t) for t in all_tokens)
+        all_tokens = []
+        suffix_tokens = []
+        for request in requests:
+            if not request.prompt_tokens:
+                request.prompt_tokens = self.tokenizer.encode(request.prompt)
+            if not request.prompt_tokens:
+                raise ValueError("prompt must tokenize to at least one token")
+
+            # A full prompt cache cannot produce next-token logits by itself. Leave the
+            # final prompt token for prefill so the model emits the first sampled token.
+            max_prefix_len = len(request.prompt_tokens) - 1
+            if request.cache_pos > max_prefix_len:
+                request.cache_pos = max_prefix_len
+                request.prefix_cache_len = min(request.prefix_cache_len, request.cache_pos)
+                if request.kv_cache is not None:
+                    request.kv_cache = request.kv_cache.slice(request.cache_pos)
+
+            all_tokens.append(request.prompt_tokens)
+            suffix_tokens.append(request.prompt_tokens[request.cache_pos:])
+
+        max_len = max(len(t) for t in suffix_tokens)
 
         pad_id = self.tokenizer.pad_token_id or 0
-        padded = [([pad_id] * (max_len - len(t))) + t for t in all_tokens]
-        pad_lengths_py = [max_len - len(t) for t in all_tokens]
+        padded = [([pad_id] * (max_len - len(t))) + t for t in suffix_tokens]
+        pad_lengths_py = [max_len - len(t) for t in suffix_tokens]
         tokens = torch.tensor(padded, device=device)
 
         last_logits = self._forward_pass(tokens, requests, pad_lengths_py=pad_lengths_py)
@@ -180,6 +252,7 @@ class Engine:
             self._finalize_generated_token(request, next_tokens[i].item())
             request.cache_pos = len(all_tokens[i])
             request.is_prefill = False
+            self._store_prompt_prefix(request)
 
     def decode_batch(self, requests: List[Request]):
         """single-step decode for a batch of requests in a single forward pass"""

@@ -8,11 +8,12 @@ from .linear import FeedForward
 class TransformerBlock(nn.Module):
     def __init__(self, hidden_size=2560, num_heads=32, num_kv_groups=8,
                  head_dim=128, intermediate_size=9728, rms_norm_eps=1e-6,
-                 dtype=torch.bfloat16):
+                 dtype=torch.bfloat16, sdpa_backend: str = "auto"):
         super().__init__()
         self.self_attn = GroupedQueryAttention(
             d_in=hidden_size, num_heads=num_heads,
-            num_kv_groups=num_kv_groups, head_dim=head_dim, dtype=dtype
+            num_kv_groups=num_kv_groups, head_dim=head_dim, dtype=dtype,
+            sdpa_backend=sdpa_backend,
         )
         self.mlp = FeedForward(emb_dim=hidden_size, hidden_dim=intermediate_size, dtype=dtype)
         self.input_layernorm = nn.RMSNorm(hidden_size, eps=rms_norm_eps, dtype=dtype)

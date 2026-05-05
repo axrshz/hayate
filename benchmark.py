@@ -6,6 +6,7 @@ import torch
 from transformers import AutoTokenizer
 
 from hayate.engine.engine import Engine, Request
+from hayate.model.attention import SDPA_BACKENDS
 
 
 MODEL_NAME = "Qwen/Qwen3-4B"
@@ -15,6 +16,9 @@ DEFAULT_REPETITIONS = 5
 DEFAULT_ARRIVAL_GAP_MS = 25.0
 DEFAULT_PROMPT_TOKENS_MIN = 160
 DEFAULT_PROMPT_TOKENS_MAX = 320
+DEFAULT_PREFIX_SHARED_TOKENS = 256
+DEFAULT_PREFIX_SUFFIX_TOKENS = 32
+DEFAULT_PREFIX_CACHE_MAX_TOKENS = 4096
 
 
 def set_seed(seed):
@@ -63,6 +67,44 @@ def generate_requests(
             {
                 "prompt": prompt,
                 "prompt_tokens": prompt_tokens,
+                "max_tokens": max_tokens,
+            }
+        )
+
+    return requests
+
+
+def common_prefix_len(left, right):
+    limit = min(len(left), len(right))
+    idx = 0
+    while idx < limit and left[idx] == right[idx]:
+        idx += 1
+    return idx
+
+
+def generate_shared_prefix_requests(
+    tokenizer,
+    n_requests,
+    max_tokens,
+    seed,
+    shared_prefix_tokens=DEFAULT_PREFIX_SHARED_TOKENS,
+    suffix_tokens=DEFAULT_PREFIX_SUFFIX_TOKENS,
+):
+    rng = random.Random(seed)
+    shared_prefix, _ = build_prompt(tokenizer, rng, shared_prefix_tokens)
+    shared_prefix = f"{shared_prefix}\n\n"
+    shared_prefix_ids = tokenizer.encode(shared_prefix)
+    requests = []
+
+    for _ in range(n_requests):
+        suffix, _ = build_prompt(tokenizer, rng, suffix_tokens)
+        prompt = shared_prefix + suffix
+        prompt_ids = tokenizer.encode(prompt)
+        requests.append(
+            {
+                "prompt": prompt,
+                "prompt_tokens": len(prompt_ids),
+                "shared_prefix_tokens": common_prefix_len(shared_prefix_ids, prompt_ids),
                 "max_tokens": max_tokens,
             }
         )
@@ -158,6 +200,28 @@ def print_benchmark_summary(title, latencies, elapsed, generated_tokens, total_t
     print(f"  total tokens:    {total_tokens:>11}")
     print(f"  generated_tok/s: {generated_tokens / elapsed:>11.2f}")
     print(f"  total_tok/s:     {total_tokens / elapsed:>11.2f}")
+
+
+def print_prefix_cache_comparison(baseline_result, cached_result):
+    print_header("Prefix Cache Summary")
+    print(f"  {'mode':<20} {'mean':>10} {'p50':>10} {'p95':>10} {'total tok/s':>12} {'cached prompt tok':>18}")
+    print(f"  {'-'*20} {'-'*10} {'-'*10} {'-'*10} {'-'*12} {'-'*18}")
+
+    for title, result in (
+        ("prefix cache off", baseline_result),
+        ("prefix cache on", cached_result),
+    ):
+        print(
+            f"  {title:<20} "
+            f"{sum(result['latencies']) / len(result['latencies']):>9.3f}s "
+            f"{percentile(result['latencies'], 50):>9.3f}s "
+            f"{percentile(result['latencies'], 95):>9.3f}s "
+            f"{result['total_tokens'] / result['elapsed']:>11.2f} "
+            f"{result['cached_prompt_tokens']:>18}"
+        )
+
+    speedup = baseline_result["elapsed"] / cached_result["elapsed"]
+    print(f"\n  elapsed speedup: {speedup:.2f}x")
 
 
 def warmup_single_request(engine, request):
@@ -330,6 +394,66 @@ def benchmark_continuous_batch(engine, requests, repetitions, arrival_gap_ms):
     }
 
 
+def benchmark_prefix_cache_requests(engine, requests, repetitions):
+    # Warm model kernels/compiled graph without leaving benchmark state in the prefix cache.
+    for request in requests[: min(2, len(requests))]:
+        warmup_single_request(engine, request)
+    engine.clear_prefix_cache()
+
+    latencies = []
+    generated_tokens = 0
+    total_tokens = 0
+    cached_prompt_tokens = 0
+    total_elapsed = 0.0
+
+    for _ in range(repetitions):
+        for request in requests:
+            synchronize_device()
+            start = time.perf_counter()
+            result = engine.generate_text(request["prompt"], max_tokens=request["max_tokens"])
+            synchronize_device()
+            elapsed = time.perf_counter() - start
+
+            generated = len(result.tokens)
+            latencies.append(elapsed)
+            generated_tokens += generated
+            total_tokens += request["prompt_tokens"] + generated
+            cached_prompt_tokens += result.prefix_cache_len
+            total_elapsed += elapsed
+
+    return {
+        "latencies": latencies,
+        "elapsed": total_elapsed,
+        "generated_tokens": generated_tokens,
+        "total_tokens": total_tokens,
+        "cached_prompt_tokens": cached_prompt_tokens,
+    }
+
+
+def benchmark_prefix_cache(
+    requests,
+    repetitions,
+    compile=False,
+    prefix_cache_max_tokens=DEFAULT_PREFIX_CACHE_MAX_TOKENS,
+    sdpa_backend="auto",
+):
+    baseline_engine = Engine(MODEL_NAME, compile=compile, sdpa_backend=sdpa_backend)
+    baseline_result = benchmark_prefix_cache_requests(baseline_engine, requests, repetitions)
+    cleanup_engine(baseline_engine)
+
+    cached_engine = Engine(
+        MODEL_NAME,
+        compile=compile,
+        enable_prefix_cache=True,
+        prefix_cache_max_tokens=prefix_cache_max_tokens,
+        sdpa_backend=sdpa_backend,
+    )
+    cached_result = benchmark_prefix_cache_requests(cached_engine, requests, repetitions)
+    cleanup_engine(cached_engine)
+
+    return baseline_result, cached_result
+
+
 def run_benchmark(
     n_requests=10,
     repetitions=DEFAULT_REPETITIONS,
@@ -340,6 +464,11 @@ def run_benchmark(
     max_prompt_tokens=DEFAULT_PROMPT_TOKENS_MAX,
     verbose=False,
     compile=False,
+    sdpa_backend="auto",
+    prefix_cache=False,
+    prefix_shared_tokens=DEFAULT_PREFIX_SHARED_TOKENS,
+    prefix_suffix_tokens=DEFAULT_PREFIX_SUFFIX_TOKENS,
+    prefix_cache_max_tokens=DEFAULT_PREFIX_CACHE_MAX_TOKENS,
 ):
     if n_requests < 1:
         raise ValueError("n_requests must be at least 1")
@@ -351,6 +480,14 @@ def run_benchmark(
         raise ValueError("prompt token bounds must be at least 1")
     if min_prompt_tokens > max_prompt_tokens:
         raise ValueError("min_prompt_tokens cannot exceed max_prompt_tokens")
+    if prefix_shared_tokens < 1 or prefix_suffix_tokens < 1:
+        raise ValueError("prefix token bounds must be at least 1")
+    if prefix_cache_max_tokens < 1:
+        raise ValueError("prefix cache max tokens must be at least 1")
+    if prefix_cache and n_requests < 2:
+        raise ValueError("prefix cache benchmark needs at least 2 requests")
+    if sdpa_backend not in SDPA_BACKENDS:
+        raise ValueError(f"unknown SDPA backend '{sdpa_backend}'. Valid options: {SDPA_BACKENDS}")
 
     set_seed(seed)
     device_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
@@ -366,16 +503,17 @@ def run_benchmark(
     )
 
     print_request_set_summary(requests, repetitions, arrival_gap_ms, seed, device_name, vram)
+    print(f"  sdpa backend:          {sdpa_backend}")
 
-    engine = Engine(MODEL_NAME, compile=compile)
+    engine = Engine(MODEL_NAME, compile=compile, sdpa_backend=sdpa_backend)
     single_result = benchmark_single_request(engine, requests, repetitions)
     cleanup_engine(engine)
 
-    engine = Engine(MODEL_NAME, compile=compile)
+    engine = Engine(MODEL_NAME, compile=compile, sdpa_backend=sdpa_backend)
     static_batch_result = benchmark_static_batch(engine, requests, repetitions)
     cleanup_engine(engine)
 
-    engine = Engine(MODEL_NAME, compile=compile)
+    engine = Engine(MODEL_NAME, compile=compile, sdpa_backend=sdpa_backend)
     continuous_batch_result = benchmark_continuous_batch(engine, requests, repetitions, arrival_gap_ms)
     cleanup_engine(engine)
 
@@ -398,6 +536,34 @@ def run_benchmark(
     ]
 
     print_compact_summary(benchmark_rows)
+
+    if prefix_cache:
+        prefix_requests = generate_shared_prefix_requests(
+            tokenizer=tokenizer,
+            n_requests=n_requests,
+            max_tokens=max_tokens,
+            seed=seed,
+            shared_prefix_tokens=prefix_shared_tokens,
+            suffix_tokens=prefix_suffix_tokens,
+        )
+        shared_tokens = [req["shared_prefix_tokens"] for req in prefix_requests]
+        print_header("Prefix Cache Workload")
+        print(f"  requests:                  {len(prefix_requests)}")
+        print(f"  repetitions:               {repetitions}")
+        print(f"  shared prefix tokens min:  {min(shared_tokens)}")
+        print(f"  shared prefix tokens mean: {sum(shared_tokens) / len(shared_tokens):.1f}")
+        print(f"  shared prefix tokens max:  {max(shared_tokens)}")
+        print(f"  suffix token target:       {prefix_suffix_tokens}")
+        print(f"  cache budget tokens:       {prefix_cache_max_tokens}")
+
+        baseline_result, cached_result = benchmark_prefix_cache(
+            requests=prefix_requests,
+            repetitions=repetitions,
+            compile=compile,
+            prefix_cache_max_tokens=prefix_cache_max_tokens,
+            sdpa_backend=sdpa_backend,
+        )
+        print_prefix_cache_comparison(baseline_result, cached_result)
 
     if verbose:
         print_verbose_summary(benchmark_rows)
@@ -442,6 +608,11 @@ def parse_args():
     parser.add_argument("--max-prompt-tokens", type=int, default=DEFAULT_PROMPT_TOKENS_MAX)
     parser.add_argument("--verbose", action="store_true", help="Print detailed per-mode benchmark breakdowns.")
     parser.add_argument("--compile", action="store_true", help="Wrap the model in torch.compile (adds a multi-minute warmup).")
+    parser.add_argument("--sdpa-backend", choices=SDPA_BACKENDS, default="auto", help="Force a PyTorch SDPA backend.")
+    parser.add_argument("--prefix-cache", action="store_true", help="Also benchmark shared-prefix prompts with prefix caching on vs off.")
+    parser.add_argument("--prefix-shared-tokens", type=int, default=DEFAULT_PREFIX_SHARED_TOKENS)
+    parser.add_argument("--prefix-suffix-tokens", type=int, default=DEFAULT_PREFIX_SUFFIX_TOKENS)
+    parser.add_argument("--prefix-cache-max-tokens", type=int, default=DEFAULT_PREFIX_CACHE_MAX_TOKENS)
     return parser.parse_args()
 
 
@@ -457,4 +628,9 @@ if __name__ == "__main__":
         max_prompt_tokens=args.max_prompt_tokens,
         verbose=args.verbose,
         compile=args.compile,
+        sdpa_backend=args.sdpa_backend,
+        prefix_cache=args.prefix_cache,
+        prefix_shared_tokens=args.prefix_shared_tokens,
+        prefix_suffix_tokens=args.prefix_suffix_tokens,
+        prefix_cache_max_tokens=args.prefix_cache_max_tokens,
     )
