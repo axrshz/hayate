@@ -12,6 +12,7 @@ from hayate.model.attention import SDPA_BACKENDS
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
+COMPILE_MODES = ("default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs")
 MAX_BATCH_SIZE = 20
 MAX_DECODE_BATCH = 20
 MAX_PREFILL_BATCH = 8
@@ -41,12 +42,15 @@ class Engine:
         self,
         model_name: str,
         compile: bool = False,
+        compile_mode: str = "default",
         enable_prefix_cache: bool = False,
         prefix_cache_max_tokens: int = DEFAULT_PREFIX_CACHE_MAX_TOKENS,
         sdpa_backend: str = "auto",
     ):
         if sdpa_backend not in SDPA_BACKENDS:
             raise ValueError(f"unknown SDPA backend '{sdpa_backend}'. Valid options: {SDPA_BACKENDS}")
+        if compile_mode not in COMPILE_MODES:
+            raise ValueError(f"unknown compile mode '{compile_mode}'. Valid options: {COMPILE_MODES}")
 
         self.model = Qwen3Model(sdpa_backend=sdpa_backend)
         self.num_layers = self.model.num_layers
@@ -56,20 +60,13 @@ class Engine:
         load_weights(self.model, model_name)
         self.model = self.model.to(device)
         if compile:
-            # dynamic=True: Dynamo treats (B, T, L_prev) as symbolic, so we compile the
-            # Inductor graph exactly once instead of per shape combo.
-            # mode="reduce-overhead": Inductor captures a CUDA graph per unique runtime
-            # shape on first encounter, then replays it on subsequent calls. This removes
-            # per-kernel launch overhead on the hot path — a big win for decode where the
-            # batch is small and kernels are short. Trade-offs:
-            #   - First call at each new (B, T, L_prev) pays a capture cost (cheap vs the
-            #     initial Dynamo trace, but nonzero). Decode's L_prev grows by 1 per step,
-            #     so expect ~max_tokens captures before steady state.
-            #   - Extra GPU memory for static I/O buffers and the graph pool.
-            #   - Outputs are backed by a graph-owned buffer and are overwritten on the
-            #     next forward. We consume them (sample + scatter's torch.cat) before the
-            #     next call, so this is safe for our flow.
-            self.model = torch.compile(self.model, dynamic=True, mode="reduce-overhead")
+            # dynamic=True lets Dynamo handle varying batch size and cache length.
+            # The default compile mode is friendlier to 24GB GPUs than reduce-overhead,
+            # which uses CUDA Graph private pools for every new decode cache length.
+            if compile_mode == "default":
+                self.model = torch.compile(self.model, dynamic=True)
+            else:
+                self.model = torch.compile(self.model, dynamic=True, mode=compile_mode)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
         self.stop_token_ids = self._load_stop_token_ids(model_name)
         self.pool: Queue = Queue()

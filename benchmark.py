@@ -1,11 +1,12 @@
 import argparse
+import gc
 import random
 import string
 import time
 import torch
 from transformers import AutoTokenizer
 
-from hayate.engine.engine import Engine, Request
+from hayate.engine.engine import COMPILE_MODES, Engine, Request
 from hayate.model.attention import SDPA_BACKENDS
 
 
@@ -134,9 +135,19 @@ def percentile(values, pct):
 
 
 def cleanup_engine(engine):
-    del engine
+    if hasattr(engine, "current_batch"):
+        engine.current_batch.clear()
+    if hasattr(engine, "pool"):
+        while not engine.pool.empty():
+            engine.pool.get()
+    if hasattr(engine, "prefix_cache") and engine.prefix_cache is not None:
+        engine.clear_prefix_cache()
+    if hasattr(engine, "model"):
+        del engine.model
+    gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
 
 
 def print_request_set_summary(requests, repetitions, arrival_gap_ms, seed, device_name, vram):
@@ -434,16 +445,18 @@ def benchmark_prefix_cache(
     requests,
     repetitions,
     compile=False,
+    compile_mode="default",
     prefix_cache_max_tokens=DEFAULT_PREFIX_CACHE_MAX_TOKENS,
     sdpa_backend="auto",
 ):
-    baseline_engine = Engine(MODEL_NAME, compile=compile, sdpa_backend=sdpa_backend)
+    baseline_engine = Engine(MODEL_NAME, compile=compile, compile_mode=compile_mode, sdpa_backend=sdpa_backend)
     baseline_result = benchmark_prefix_cache_requests(baseline_engine, requests, repetitions)
     cleanup_engine(baseline_engine)
 
     cached_engine = Engine(
         MODEL_NAME,
         compile=compile,
+        compile_mode=compile_mode,
         enable_prefix_cache=True,
         prefix_cache_max_tokens=prefix_cache_max_tokens,
         sdpa_backend=sdpa_backend,
@@ -464,6 +477,7 @@ def run_benchmark(
     max_prompt_tokens=DEFAULT_PROMPT_TOKENS_MAX,
     verbose=False,
     compile=False,
+    compile_mode="default",
     sdpa_backend="auto",
     prefix_cache=False,
     prefix_shared_tokens=DEFAULT_PREFIX_SHARED_TOKENS,
@@ -488,6 +502,8 @@ def run_benchmark(
         raise ValueError("prefix cache benchmark needs at least 2 requests")
     if sdpa_backend not in SDPA_BACKENDS:
         raise ValueError(f"unknown SDPA backend '{sdpa_backend}'. Valid options: {SDPA_BACKENDS}")
+    if compile_mode not in COMPILE_MODES:
+        raise ValueError(f"unknown compile mode '{compile_mode}'. Valid options: {COMPILE_MODES}")
 
     set_seed(seed)
     device_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
@@ -504,16 +520,18 @@ def run_benchmark(
 
     print_request_set_summary(requests, repetitions, arrival_gap_ms, seed, device_name, vram)
     print(f"  sdpa backend:          {sdpa_backend}")
+    if compile:
+        print(f"  compile mode:          {compile_mode}")
 
-    engine = Engine(MODEL_NAME, compile=compile, sdpa_backend=sdpa_backend)
+    engine = Engine(MODEL_NAME, compile=compile, compile_mode=compile_mode, sdpa_backend=sdpa_backend)
     single_result = benchmark_single_request(engine, requests, repetitions)
     cleanup_engine(engine)
 
-    engine = Engine(MODEL_NAME, compile=compile, sdpa_backend=sdpa_backend)
+    engine = Engine(MODEL_NAME, compile=compile, compile_mode=compile_mode, sdpa_backend=sdpa_backend)
     static_batch_result = benchmark_static_batch(engine, requests, repetitions)
     cleanup_engine(engine)
 
-    engine = Engine(MODEL_NAME, compile=compile, sdpa_backend=sdpa_backend)
+    engine = Engine(MODEL_NAME, compile=compile, compile_mode=compile_mode, sdpa_backend=sdpa_backend)
     continuous_batch_result = benchmark_continuous_batch(engine, requests, repetitions, arrival_gap_ms)
     cleanup_engine(engine)
 
@@ -560,6 +578,7 @@ def run_benchmark(
             requests=prefix_requests,
             repetitions=repetitions,
             compile=compile,
+            compile_mode=compile_mode,
             prefix_cache_max_tokens=prefix_cache_max_tokens,
             sdpa_backend=sdpa_backend,
         )
@@ -608,6 +627,12 @@ def parse_args():
     parser.add_argument("--max-prompt-tokens", type=int, default=DEFAULT_PROMPT_TOKENS_MAX)
     parser.add_argument("--verbose", action="store_true", help="Print detailed per-mode benchmark breakdowns.")
     parser.add_argument("--compile", action="store_true", help="Wrap the model in torch.compile (adds a multi-minute warmup).")
+    parser.add_argument(
+        "--compile-mode",
+        choices=COMPILE_MODES,
+        default="default",
+        help="torch.compile mode. Plain --compile uses the memory-friendlier default mode.",
+    )
     parser.add_argument("--sdpa-backend", choices=SDPA_BACKENDS, default="auto", help="Force a PyTorch SDPA backend.")
     parser.add_argument("--prefix-cache", action="store_true", help="Also benchmark shared-prefix prompts with prefix caching on vs off.")
     parser.add_argument("--prefix-shared-tokens", type=int, default=DEFAULT_PREFIX_SHARED_TOKENS)
@@ -628,6 +653,7 @@ if __name__ == "__main__":
         max_prompt_tokens=args.max_prompt_tokens,
         verbose=args.verbose,
         compile=args.compile,
+        compile_mode=args.compile_mode,
         sdpa_backend=args.sdpa_backend,
         prefix_cache=args.prefix_cache,
         prefix_shared_tokens=args.prefix_shared_tokens,

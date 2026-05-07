@@ -26,14 +26,22 @@ Use `--verbose` if you want the detailed per-mode breakdown:
 python benchmark.py 10 --verbose
 ```
 
-Pass `--compile` to wrap the model in `torch.compile(..., dynamic=True)` so the
-compiled graph handles varying batch size and cache length without re-specializing.
-Expect a multi-minute warmup on the first prefill and the first decode; subsequent
-calls are fast.
+Pass `--compile` to wrap the model in `torch.compile(..., dynamic=True)`. The
+default compile mode avoids CUDA Graph private pools, which keeps memory use lower
+on 24GB GPUs.
 
 ```bash
 python benchmark.py 10 --compile
 ```
+
+You can still opt into more aggressive compile modes for larger GPUs:
+
+```bash
+python benchmark.py 10 --compile --compile-mode reduce-overhead
+```
+
+`reduce-overhead` can be faster, but it captures CUDA graphs. Decode changes cache
+length every step, so graph private pools can accumulate and trigger CUDA OOM.
 
 PyTorch SDPA backend selection is exposed through `Engine` and the benchmark. The
 default `auto` mode lets PyTorch pick the best available kernel; use `flash`,
