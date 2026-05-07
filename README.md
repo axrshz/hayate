@@ -85,9 +85,9 @@ without `--compile`:
 ```text
 mode                       mean        p50        p95  total tok/s
 -------------------- ---------- ---------- ---------- ------------
-single request           7.356s     7.326s     7.453s       65.39
-submit all upfront      17.405s    17.405s    17.411s      276.36
-staggered arrivals      17.335s    17.236s    17.906s      273.78
+single request           9.872s     9.801s    10.254s       48.73
+submit all upfront      12.925s    12.875s    13.072s      372.15
+staggered arrivals      13.105s    13.080s    13.508s      361.49
 ```
 
 with `--compile`:
@@ -95,9 +95,9 @@ with `--compile`:
 ```text
 mode                       mean        p50        p95  total tok/s
 -------------------- ---------- ---------- ---------- ------------
-single request           5.337s     5.312s     5.558s       90.13
-submit all upfront      12.912s    12.907s    12.925s      372.52
-staggered arrivals      13.003s    12.882s    13.639s      364.56
+single request           4.382s     4.373s     4.571s      109.78
+submit all upfront       9.459s     9.396s     9.727s      508.51
+staggered arrivals       9.704s     9.627s    10.230s      485.16
 ```
 
 ## Todo
