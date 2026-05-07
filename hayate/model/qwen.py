@@ -23,6 +23,7 @@ class Qwen3Model(nn.Module):
         self.num_layers = num_layers
         self.num_kv_groups = num_kv_groups
         self.head_dim = head_dim
+        self.max_position_embeddings = max_position_embeddings
 
         self.embed_tokens = nn.Embedding(vocab_size, hidden_size, dtype=torch.bfloat16)
         self.layers = nn.ModuleList([

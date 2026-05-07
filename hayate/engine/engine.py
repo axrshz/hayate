@@ -1,6 +1,6 @@
 import torch
 from typing import List, Union
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, GenerationConfig
 from dataclasses import dataclass, field
 from queue import Queue
 
@@ -52,6 +52,7 @@ class Engine:
         self.num_layers = self.model.num_layers
         self.num_kv_groups = self.model.num_kv_groups
         self.head_dim = self.model.head_dim
+        self.max_position_embeddings = self.model.max_position_embeddings
         load_weights(self.model, model_name)
         self.model = self.model.to(device)
         if compile:
@@ -70,10 +71,28 @@ class Engine:
             #     next call, so this is safe for our flow.
             self.model = torch.compile(self.model, dynamic=True, mode="reduce-overhead")
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+        self.stop_token_ids = self._load_stop_token_ids(model_name)
         self.pool: Queue = Queue()
         self.current_batch: List[Request] = []
         self.request_id = 0
         self.prefix_cache = PrefixCache(prefix_cache_max_tokens) if enable_prefix_cache else None
+
+    def _load_stop_token_ids(self, model_name: str) -> set[int]:
+        """Collect every configured EOS token, not just tokenizer.eos_token_id."""
+        token_ids = set()
+        try:
+            generation_config = GenerationConfig.from_pretrained(model_name)
+            eos_token_id = generation_config.eos_token_id
+            if isinstance(eos_token_id, int):
+                token_ids.add(eos_token_id)
+            elif eos_token_id is not None:
+                token_ids.update(int(tok) for tok in eos_token_id)
+        except Exception:
+            pass
+
+        if self.tokenizer.eos_token_id is not None:
+            token_ids.add(int(self.tokenizer.eos_token_id))
+        return token_ids
 
     def add_request(self, request: Request):
         """adds a request in the pool"""
@@ -86,7 +105,9 @@ class Engine:
             request.prompt_tokens = self.tokenizer.encode(request.prompt)
 
         if not request.use_cache:
-            return
+            raise ValueError("use_cache=False is not supported by decode; leave request caching enabled")
+
+        self._validate_request_lengths(request)
 
         if request.kv_cache is not None and request.kv_cache.length > 0:
             request.cache_pos = request.kv_cache.length
@@ -107,6 +128,21 @@ class Engine:
         request.cache_pos = match.length
         request.prefix_cache_len = match.length
 
+    def _validate_request_lengths(self, request: Request):
+        if request.max_tokens < 1:
+            raise ValueError("max_tokens must be at least 1")
+        if not request.prompt_tokens:
+            raise ValueError("prompt must tokenize to at least one token")
+
+        required_positions = len(request.prompt_tokens) + request.max_tokens - 1
+        if required_positions > self.max_position_embeddings:
+            raise ValueError(
+                "request exceeds model context window: "
+                f"prompt tokens ({len(request.prompt_tokens)}) + generated-token positions "
+                f"({request.max_tokens - 1}) = {required_positions}, "
+                f"max supported positions = {self.max_position_embeddings}"
+            )
+
     def clear_prefix_cache(self):
         """Drop all cached prompt prefixes."""
         if self.prefix_cache is not None:
@@ -126,7 +162,7 @@ class Engine:
     def _finalize_generated_token(self, request: Request, tok: int):
         """Append a sampled token and complete the request if it hit a stop condition."""
         request.tokens.append(tok)
-        if tok == self.tokenizer.eos_token_id or len(request.tokens) >= request.max_tokens:
+        if tok in self.stop_token_ids or len(request.tokens) >= request.max_tokens:
             request.is_completed = True
             request.response = self.tokenizer.decode(request.tokens, skip_special_tokens=True)
 

@@ -1,21 +1,85 @@
+import json
 import os
+import re
 from glob import glob
 
 import torch
-from safetensors import safe_open
+from safetensors import SafetensorError, safe_open
 from huggingface_hub import snapshot_download
 
 
+def _load_weight_index(local_dir: str) -> dict | None:
+    index_path = os.path.join(local_dir, "model.safetensors.index.json")
+    if not os.path.isfile(index_path):
+        return None
+
+    with open(index_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _expected_shards(weight_index: dict | None) -> set[str]:
+    if weight_index is None:
+        return set()
+    return set(weight_index.get("weight_map", {}).values())
+
+
+def _expected_shards_from_filenames(local_dir: str) -> set[str]:
+    expected = set()
+    shard_pattern = re.compile(r"^(?P<prefix>.+)-(?P<idx>\d+)-of-(?P<count>\d+)\.safetensors$")
+    for path in glob(os.path.join(local_dir, "*.safetensors")):
+        filename = os.path.basename(path)
+        match = shard_pattern.match(filename)
+        if match is None:
+            continue
+
+        prefix = match.group("prefix")
+        width = len(match.group("idx"))
+        count = int(match.group("count"))
+        expected.update(f"{prefix}-{idx:0{width}d}-of-{count:0{width}d}.safetensors" for idx in range(1, count + 1))
+    return expected
+
+
+def _missing_shards(local_dir: str, shards: set[str]) -> list[str]:
+    return sorted(shard for shard in shards if not os.path.isfile(os.path.join(local_dir, shard)))
+
+
+def _has_usable_weights(local_dir: str) -> bool:
+    safetensor_files = glob(os.path.join(local_dir, "*.safetensors"))
+    if not safetensor_files:
+        return False
+
+    weight_index = _load_weight_index(local_dir)
+    expected = _expected_shards(weight_index) or _expected_shards_from_filenames(local_dir)
+    missing = _missing_shards(local_dir, expected)
+    return not missing
+
+
 def download_weights(repo_id: str, local_dir: str):
-    """download model weights from huggingface if not already present locally"""
-    if os.path.isdir(local_dir) and glob(os.path.join(local_dir, "*.safetensors")):
-        return
+    """Download model weights from Hugging Face unless a complete local copy exists."""
+    if os.path.isdir(repo_id):
+        return repo_id
+
+    if os.path.isdir(local_dir) and _has_usable_weights(local_dir):
+        return local_dir
+
     print(f"Downloading weights from {repo_id} to {local_dir}/ ...")
     snapshot_download(
         repo_id=repo_id,
         local_dir=local_dir,
         allow_patterns=["*.safetensors", "*.json", "tokenizer*"],
     )
+    if not _has_usable_weights(local_dir):
+        weight_index = _load_weight_index(local_dir)
+        expected = _expected_shards(weight_index) or _expected_shards_from_filenames(local_dir)
+        missing = _missing_shards(local_dir, expected)
+        if missing:
+            raise FileNotFoundError(
+                "Downloaded checkpoint is incomplete. Missing shard(s): "
+                f"{', '.join(missing)}. Delete '{local_dir}' and rerun, or run "
+                "`huggingface-cli download Qwen/Qwen3-4B --local-dir Qwen3-4B`."
+            )
+        raise FileNotFoundError(f"No safetensor checkpoint files found in '{local_dir}'.")
+    return local_dir
 
 
 def assign(left, right, tensor_name="unknown"):
@@ -69,24 +133,55 @@ def qwen_weight_map(model):
 def load_weights(model, repo_id: str):
     """download (if needed) and explicitly load safetensor shards into the Qwen model"""
     local_dir = repo_id.split("/")[-1]
-    download_weights(repo_id, local_dir)
+    local_dir = download_weights(repo_id, local_dir)
 
     weight_map = qwen_weight_map(model)
     required_weights = {name for name in weight_map if name != "lm_head.weight"}
     loaded_weights = set()
     lm_head_loaded = False
+    weight_index = _load_weight_index(local_dir)
+
+    if weight_index is not None:
+        checkpoint_weights = set(weight_index.get("weight_map", {}))
+        missing_from_index = sorted(required_weights - checkpoint_weights)
+        if missing_from_index:
+            missing_preview = ", ".join(missing_from_index[:5])
+            if len(missing_from_index) > 5:
+                missing_preview += ", ..."
+            raise KeyError(f"Checkpoint index is missing required tensors: {missing_preview}")
+
+        missing_shards = _missing_shards(local_dir, _expected_shards(weight_index))
+        if missing_shards:
+            raise FileNotFoundError(
+                "Checkpoint is incomplete. Missing shard(s): "
+                f"{', '.join(missing_shards)}. Delete '{local_dir}' and rerun the benchmark "
+                "so the Hugging Face download can resume cleanly."
+            )
+    else:
+        missing_shards = _missing_shards(local_dir, _expected_shards_from_filenames(local_dir))
+        if missing_shards:
+            raise FileNotFoundError(
+                "Checkpoint appears to be an incomplete sharded safetensors download. "
+                f"Missing shard(s): {', '.join(missing_shards)}."
+            )
 
     for file in sorted(glob(os.path.join(local_dir, "*.safetensors"))):
-        with safe_open(file, "pt", "cpu") as f:
-            for weight_name in f.keys():
-                if weight_name not in weight_map:
-                    continue
+        try:
+            with safe_open(file, "pt", "cpu") as f:
+                for weight_name in f.keys():
+                    if weight_name not in weight_map:
+                        continue
 
-                assign(weight_map[weight_name], f.get_tensor(weight_name), weight_name)
-                loaded_weights.add(weight_name)
+                    assign(weight_map[weight_name], f.get_tensor(weight_name), weight_name)
+                    loaded_weights.add(weight_name)
 
-                if weight_name == "lm_head.weight":
-                    lm_head_loaded = True
+                    if weight_name == "lm_head.weight":
+                        lm_head_loaded = True
+        except SafetensorError as exc:
+            raise RuntimeError(
+                f"Failed to read checkpoint shard '{file}'. The file may be incomplete or "
+                f"corrupt; delete '{local_dir}' and rerun to redownload it."
+            ) from exc
 
     missing_weights = sorted(required_weights - loaded_weights)
     if missing_weights:
