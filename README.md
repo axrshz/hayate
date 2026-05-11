@@ -110,4 +110,3 @@ staggered arrivals       9.704s     9.627s    10.230s      485.16
 - [x] prefix caching
 - [x] pytorch fused sdpa
 - [ ] paged attention
-- [ ] custom kernels
