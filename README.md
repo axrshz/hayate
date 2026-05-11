@@ -14,7 +14,7 @@ uv pip install -e .
 
 ## Run
 
-Run the benchmark with the default non-verbose output:
+Run the benchmark with batch size:
 
 ```bash
 python benchmark.py 10
@@ -34,25 +34,13 @@ on 24GB GPUs.
 python benchmark.py 10 --compile
 ```
 
-You can still opt into more aggressive compile modes for larger GPUs:
-
-```bash
-python benchmark.py 10 --compile --compile-mode reduce-overhead
-```
-
-`reduce-overhead` can be faster, but it captures CUDA graphs. Decode changes cache
-length every step, so graph private pools can accumulate and trigger CUDA OOM.
-
 PyTorch SDPA backend selection is exposed through `Engine` and the benchmark. The
 default `auto` mode lets PyTorch pick the best available kernel; use `flash`,
 `efficient`, or `math` to force a backend for GPU experiments:
 
 ```bash
-python benchmark.py 10 --sdpa-backend efficient
+python benchmark.py 10 --sdpa-backend
 ```
-
-Forced fused backends can fail if the active PyTorch/CUDA build does not support the
-current mask, dtype, GQA, or sequence shape. Use `auto` for the safest dispatch path.
 
 Prefix caching is available as an opt-in engine feature for workloads where prompts
 share token prefixes:
@@ -78,7 +66,7 @@ Tune the synthetic workload with `--prefix-shared-tokens`,
 
 ## Benchmark
 
-`Qwen/Qwen3-4B` on an `NVIDIA A40 (47.7GB)`, 10 requests, 5 reps.
+`Qwen/Qwen3-4B` on an `RTX 3090 (24GB)`, 10 requests, 5 reps.
 
 without `--compile`:
 
