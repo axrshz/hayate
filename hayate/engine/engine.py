@@ -1,40 +1,21 @@
 import torch
 from typing import List, Union
 from transformers import AutoTokenizer, GenerationConfig
-from dataclasses import dataclass, field
-from queue import Queue
 
 from hayate.model import Qwen3Model
 from hayate.utils import load_weights
 from hayate.model.cache import Cache
 from hayate.engine.prefix_cache import PrefixCache
-from hayate.model.attention import SDPA_BACKENDS
-
-device = "cuda" if torch.cuda.is_available() else "cpu"
-
-COMPILE_MODES = ("default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs")
-MAX_BATCH_SIZE = 20
-MAX_DECODE_BATCH = 20
-MAX_PREFILL_BATCH = 8
-DEFAULT_PREFIX_CACHE_MAX_TOKENS = 4096
-
-@dataclass
-class Request:
-    id: int = 0
-    prompt: str = ""
-    max_tokens: int = 100
-
-    prompt_tokens: List[int] = field(default_factory=list)
-    tokens: List[int] = field(default_factory=list)
-    kv_cache: Cache | None = None
-
-    cache_pos: int = 0
-    prefix_cache_len: int = 0
-    is_completed: bool = False
-    is_prefill: bool = True
-    use_cache: bool = True
-
-    response: str | None = None
+from hayate.engine.constants import (
+    COMPILE_MODES,
+    DEFAULT_PREFIX_CACHE_MAX_TOKENS,
+    MAX_PREFILL_BATCH,
+    device,
+)
+from hayate.engine.request import Request
+from hayate.engine.cache_ops import gather_caches, scatter_caches
+from hayate.engine.sampler import Sampler
+from hayate.engine.scheduler import Scheduler
 
 
 class Engine:
@@ -45,14 +26,11 @@ class Engine:
         compile_mode: str = "default",
         enable_prefix_cache: bool = False,
         prefix_cache_max_tokens: int = DEFAULT_PREFIX_CACHE_MAX_TOKENS,
-        sdpa_backend: str = "auto",
     ):
-        if sdpa_backend not in SDPA_BACKENDS:
-            raise ValueError(f"unknown SDPA backend '{sdpa_backend}'. Valid options: {SDPA_BACKENDS}")
         if compile_mode not in COMPILE_MODES:
             raise ValueError(f"unknown compile mode '{compile_mode}'. Valid options: {COMPILE_MODES}")
 
-        self.model = Qwen3Model(sdpa_backend=sdpa_backend)
+        self.model = Qwen3Model()
         self.num_layers = self.model.num_layers
         self.num_kv_groups = self.model.num_kv_groups
         self.head_dim = self.model.head_dim
@@ -69,10 +47,9 @@ class Engine:
                 self.model = torch.compile(self.model, dynamic=True, mode=compile_mode)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
         self.stop_token_ids = self._load_stop_token_ids(model_name)
-        self.pool: Queue = Queue()
-        self.current_batch: List[Request] = []
-        self.request_id = 0
+        self.scheduler = Scheduler()
         self.prefix_cache = PrefixCache(prefix_cache_max_tokens) if enable_prefix_cache else None
+        self.sampler = Sampler(self.tokenizer, self.stop_token_ids)
 
     def _load_stop_token_ids(self, model_name: str) -> set[int]:
         """Collect every configured EOS token, not just tokenizer.eos_token_id."""
@@ -92,9 +69,9 @@ class Engine:
         return token_ids
 
     def add_request(self, request: Request):
-        """adds a request in the pool"""
+        """Adds a request to the pool."""
         self._prepare_request(request)
-        self.pool.put(request)
+        self.scheduler.add(request)
 
     def _prepare_request(self, request: Request):
         """Tokenize and seed the request with the longest reusable prompt prefix."""
@@ -152,83 +129,9 @@ class Engine:
             return
         self.prefix_cache.put(request.prompt_tokens, request.kv_cache)
 
-    def sample(self, logits):
-        """select the next token greedily via argmax"""
-        return torch.argmax(logits, dim=-1, keepdim=True)
-
-    def _finalize_generated_token(self, request: Request, tok: int):
-        """Append a sampled token and complete the request if it hit a stop condition."""
-        request.tokens.append(tok)
-        if tok in self.stop_token_ids or len(request.tokens) >= request.max_tokens:
-            request.is_completed = True
-            request.response = self.tokenizer.decode(request.tokens, skip_special_tokens=True)
-
-    def _gather_caches(self, requests: List[Request]):
-        """Stack per-request caches into a single batched, right-padded tensor.
-
-        Returns (prev_k, prev_v, cache_lens) where prev_k/prev_v have shape
-        (num_layers, B, H_kv, L_max, D), or (None, None, None) when no request has
-        any cached K/V yet (pure prefill).
-        """
-        batch_size = len(requests)
-        cache_lens_py: List[int] = []
-        ref: torch.Tensor | None = None
-        for r in requests:
-            cache = r.kv_cache
-            if cache is not None and cache.k is not None:
-                cache_lens_py.append(cache.k.shape[2])
-                if ref is None:
-                    ref = cache.k
-            else:
-                cache_lens_py.append(0)
-
-        if ref is None:
-            return None, None, None
-
-        max_cache_len = max(cache_lens_py)
-        _, H_kv, _, D = ref.shape
-        dtype, dev = ref.dtype, ref.device
-
-        prev_k = torch.zeros(self.num_layers, batch_size, H_kv, max_cache_len, D, dtype=dtype, device=dev)
-        prev_v = torch.zeros(self.num_layers, batch_size, H_kv, max_cache_len, D, dtype=dtype, device=dev)
-
-        for i, r in enumerate(requests):
-            L_i = cache_lens_py[i]
-            if L_i > 0 and r.kv_cache is not None and r.kv_cache.k is not None:
-                prev_k[:, i, :, :L_i, :] = r.kv_cache.k
-                prev_v[:, i, :, :L_i, :] = r.kv_cache.v
-
-        cache_lens = torch.tensor(cache_lens_py, dtype=torch.long, device=dev)
-        return prev_k, prev_v, cache_lens
-
-    def _scatter_caches(self, requests: List[Request], new_k, new_v,
-                        L_prev: int, num_tokens: int, pad_lengths_py: List[int] | None = None):
-        """Split updated batched caches back into per-request Cache storage.
-
-        new_k, new_v: (num_layers, B, H_kv, L_prev + T, D) stacked model outputs.
-
-        For each request i, form the compacted cache by concatenating:
-          - cache-region valid part:  cols [0, old_L_i)
-          - new-region real tokens:   cols [L_prev + pl_i, L_prev + T)
-        into a single (num_layers, H_kv, old_L_i + T - pl_i, D) tensor.
-        """
-        for i, r in enumerate(requests):
-            if r.kv_cache is None or not r.use_cache:
-                continue
-            old_L = r.cache_pos
-            pl = pad_lengths_py[i] if pad_lengths_py is not None else 0
-
-            k_old = new_k[:, i, :, :old_L, :]
-            v_old = new_v[:, i, :, :old_L, :]
-            k_new = new_k[:, i, :, L_prev + pl : L_prev + num_tokens, :]
-            v_new = new_v[:, i, :, L_prev + pl : L_prev + num_tokens, :]
-
-            r.kv_cache.k = torch.cat([k_old, k_new], dim=2)
-            r.kv_cache.v = torch.cat([v_old, v_new], dim=2)
-
     def _forward_pass(self, tokens, requests: List[Request], pad_lengths_py=None):
         """One model forward pass over a batch of requests. Returns last-token logits (B, V)."""
-        prev_k, prev_v, cache_lens = self._gather_caches(requests)
+        prev_k, prev_v, cache_lens = gather_caches(requests, self.num_layers)
         L_prev = prev_k.shape[3] if prev_k is not None else 0
         T = tokens.shape[1]
 
@@ -245,11 +148,11 @@ class Engine:
                 pad_lengths=pad_lengths_tensor,
             )
 
-        self._scatter_caches(requests, new_k, new_v, L_prev, T, pad_lengths_py=pad_lengths_py)
+        scatter_caches(requests, new_k, new_v, L_prev, T, pad_lengths_py=pad_lengths_py)
         return logits[:, -1, :]
 
     def prefill_batch(self, requests: List[Request]):
-        """batched prefill for multiple requests in a single forward pass"""
+        """Batched prefill for multiple requests in a single forward pass."""
         all_tokens = []
         suffix_tokens = []
         for request in requests:
@@ -272,46 +175,41 @@ class Engine:
 
         max_len = max(len(t) for t in suffix_tokens)
 
-        pad_id = self.tokenizer.pad_token_id or 0
+        pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
         padded = [([pad_id] * (max_len - len(t))) + t for t in suffix_tokens]
         pad_lengths_py = [max_len - len(t) for t in suffix_tokens]
         tokens = torch.tensor(padded, device=device)
 
         last_logits = self._forward_pass(tokens, requests, pad_lengths_py=pad_lengths_py)
-        next_tokens = self.sample(last_logits)
+        next_tokens = self.sampler.sample(last_logits)
 
         for i, request in enumerate(requests):
             request.prompt_tokens = all_tokens[i]
-            self._finalize_generated_token(request, next_tokens[i].item())
+            self.sampler.finalize(request, next_tokens[i].item())
             request.cache_pos = len(all_tokens[i])
             request.is_prefill = False
             self._store_prompt_prefix(request)
 
     def decode_batch(self, requests: List[Request]):
-        """single-step decode for a batch of requests in a single forward pass"""
+        """Single-step decode for a batch of requests in a single forward pass."""
         tokens = torch.tensor([[r.tokens[-1]] for r in requests], device=device)
 
         last_logits = self._forward_pass(tokens, requests, pad_lengths_py=None)
-        next_tokens = self.sample(last_logits)
+        next_tokens = self.sampler.sample(last_logits)
 
         for i, request in enumerate(requests):
             request.cache_pos += 1
             tok = next_tokens[i].item()
-            self._finalize_generated_token(request, tok)
-
-    def _get_next_batch(self):
-        self.current_batch = [r for r in self.current_batch if not r.is_completed]
-        while not self.pool.empty() and len(self.current_batch) < MAX_BATCH_SIZE:
-            self.current_batch.append(self.pool.get())
-        return self.current_batch
+            self.sampler.finalize(request, tok)
 
     def generate(self):
-        self.current_batch = self._get_next_batch()
-        if not self.current_batch:
+        """Advance the engine by one scheduler tick."""
+        batch = self.scheduler.tick()
+        if not batch:
             return False
 
-        prefill_requests = [r for r in self.current_batch if r.is_prefill]
-        decode_requests  = [r for r in self.current_batch if not r.is_prefill]
+        prefill_requests = [r for r in batch if r.is_prefill]
+        decode_requests = [r for r in batch if not r.is_prefill]
 
         for i in range(0, len(prefill_requests), MAX_PREFILL_BATCH):
             chunk = prefill_requests[i : i + MAX_PREFILL_BATCH]
@@ -323,14 +221,14 @@ class Engine:
         return True
 
     def generate_text(self, prompts: Union[str, List[str]], max_tokens: int = 100):
-        """the public api for generation"""
+        """The public API for generation."""
         if isinstance(prompts, str):
             prompts = [prompts]
 
         requests = []
         for prompt in prompts:
-            req = Request(id=self.request_id, prompt=prompt, max_tokens=max_tokens)
-            self.request_id += 1
+            req = Request(id=self.scheduler.request_id, prompt=prompt, max_tokens=max_tokens)
+            self.scheduler.request_id += 1
             self.add_request(req)
             requests.append(req)
 

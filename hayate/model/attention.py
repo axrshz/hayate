@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from contextlib import nullcontext
 
 from .rope import apply_rope_vectorized
 
@@ -12,37 +11,20 @@ except ImportError:  # pragma: no cover - kept for older local torch installs
     sdpa_kernel = None
 
 
-SDPA_BACKENDS = ("auto", "flash", "efficient", "math")
-
-
-def _sdpa_context(backend: str):
-    if backend == "auto":
-        return nullcontext()
+def _flash_sdpa_context():
     if sdpa_kernel is None or SDPBackend is None:
-        raise RuntimeError("explicit SDPA backend selection requires torch.nn.attention.sdpa_kernel")
-
-    backend_map = {
-        "flash": SDPBackend.FLASH_ATTENTION,
-        "efficient": SDPBackend.EFFICIENT_ATTENTION,
-        "math": SDPBackend.MATH,
-    }
-    try:
-        return sdpa_kernel(backends=[backend_map[backend]])
-    except KeyError as exc:
-        raise ValueError(f"unknown SDPA backend '{backend}'. Valid options: {SDPA_BACKENDS}") from exc
+        raise RuntimeError("Flash SDPA requires torch.nn.attention.sdpa_kernel")
+    return sdpa_kernel(backends=[SDPBackend.FLASH_ATTENTION])
 
 
 class GroupedQueryAttention(nn.Module):
-    def __init__(self, d_in, num_heads, num_kv_groups, head_dim, dtype=None, sdpa_backend: str = "auto"):
+    def __init__(self, d_in, num_heads, num_kv_groups, head_dim, dtype=None):
         super().__init__()
         assert num_heads % num_kv_groups == 0, "num_heads must be divisible by num_kv_groups"
-        if sdpa_backend not in SDPA_BACKENDS:
-            raise ValueError(f"unknown SDPA backend '{sdpa_backend}'. Valid options: {SDPA_BACKENDS}")
 
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.num_kv_groups = num_kv_groups
-        self.sdpa_backend = sdpa_backend
 
         self.q_proj = nn.Linear(d_in, num_heads * head_dim, bias=False, dtype=dtype)
         self.k_proj = nn.Linear(d_in, num_kv_groups * head_dim, bias=False, dtype=dtype)
@@ -85,7 +67,7 @@ class GroupedQueryAttention(nn.Module):
         else:
             full_k, full_v = k, v
 
-        with _sdpa_context(self.sdpa_backend):
+        with _flash_sdpa_context():
             context = F.scaled_dot_product_attention(
                 q, full_k, full_v,
                 attn_mask=attn_mask,

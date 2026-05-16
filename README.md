@@ -34,13 +34,7 @@ on 24GB GPUs.
 python benchmark.py 10 --compile
 ```
 
-PyTorch SDPA backend selection is exposed through `Engine` and the benchmark. The
-default `auto` mode lets PyTorch pick the best available kernel; use `flash`,
-`efficient`, or `math` to force a backend for GPU experiments:
-
-```bash
-python benchmark.py 10 --sdpa-backend
-```
+Hayate uses PyTorch Flash SDPA for attention, so run it on an NVIDIA GPU.
 
 Prefix caching is available as an opt-in engine feature for workloads where prompts
 share token prefixes:
@@ -96,5 +90,5 @@ staggered arrivals       9.704s     9.627s    10.230s      485.16
 - [x] continuous batching
 - [x] torch.compile
 - [x] prefix caching
-- [x] pytorch fused sdpa
+- [x] pytorch sdpa
 - [ ] paged attention

@@ -6,8 +6,9 @@ import time
 import torch
 from transformers import AutoTokenizer
 
-from hayate.engine.engine import COMPILE_MODES, Engine, Request
-from hayate.model.attention import SDPA_BACKENDS
+from hayate.engine.engine import Engine
+from hayate.engine.request import Request
+from hayate.engine.constants import COMPILE_MODES
 
 
 MODEL_NAME = "Qwen/Qwen3-4B"
@@ -135,11 +136,10 @@ def percentile(values, pct):
 
 
 def cleanup_engine(engine):
-    if hasattr(engine, "current_batch"):
-        engine.current_batch.clear()
-    if hasattr(engine, "pool"):
-        while not engine.pool.empty():
-            engine.pool.get()
+    if hasattr(engine, "scheduler"):
+        engine.scheduler.current_batch.clear()
+        while not engine.scheduler.pool.empty():
+            engine.scheduler.pool.get()
     if hasattr(engine, "prefix_cache") and engine.prefix_cache is not None:
         engine.clear_prefix_cache()
     if hasattr(engine, "model"):
@@ -321,7 +321,7 @@ def run_continuous_batch_once(engine, requests, arrival_gap_ms):
     synchronize_device()
     start_time = time.perf_counter()
 
-    while next_request_idx < len(requests) or engine.current_batch or not engine.pool.empty():
+    while next_request_idx < len(requests) or engine.scheduler.current_batch or not engine.scheduler.pool.empty():
         elapsed_since_start = time.perf_counter() - start_time
 
         while next_request_idx < len(requests):
@@ -331,11 +331,11 @@ def run_continuous_batch_once(engine, requests, arrival_gap_ms):
 
             request = requests[next_request_idx]
             runtime_request = Request(
-                id=engine.request_id,
+                id=engine.scheduler.request_id,
                 prompt=request["prompt"],
                 max_tokens=request["max_tokens"],
             )
-            engine.request_id += 1
+            engine.scheduler.request_id += 1
             engine.add_request(runtime_request)
             submitted_requests.append(runtime_request)
             request_metadata[runtime_request.id] = {
@@ -447,9 +447,8 @@ def benchmark_prefix_cache(
     compile=False,
     compile_mode="default",
     prefix_cache_max_tokens=DEFAULT_PREFIX_CACHE_MAX_TOKENS,
-    sdpa_backend="auto",
 ):
-    baseline_engine = Engine(MODEL_NAME, compile=compile, compile_mode=compile_mode, sdpa_backend=sdpa_backend)
+    baseline_engine = Engine(MODEL_NAME, compile=compile, compile_mode=compile_mode)
     baseline_result = benchmark_prefix_cache_requests(baseline_engine, requests, repetitions)
     cleanup_engine(baseline_engine)
 
@@ -459,7 +458,6 @@ def benchmark_prefix_cache(
         compile_mode=compile_mode,
         enable_prefix_cache=True,
         prefix_cache_max_tokens=prefix_cache_max_tokens,
-        sdpa_backend=sdpa_backend,
     )
     cached_result = benchmark_prefix_cache_requests(cached_engine, requests, repetitions)
     cleanup_engine(cached_engine)
@@ -478,7 +476,6 @@ def run_benchmark(
     verbose=False,
     compile=False,
     compile_mode="default",
-    sdpa_backend="auto",
     prefix_cache=False,
     prefix_shared_tokens=DEFAULT_PREFIX_SHARED_TOKENS,
     prefix_suffix_tokens=DEFAULT_PREFIX_SUFFIX_TOKENS,
@@ -500,8 +497,6 @@ def run_benchmark(
         raise ValueError("prefix cache max tokens must be at least 1")
     if prefix_cache and n_requests < 2:
         raise ValueError("prefix cache benchmark needs at least 2 requests")
-    if sdpa_backend not in SDPA_BACKENDS:
-        raise ValueError(f"unknown SDPA backend '{sdpa_backend}'. Valid options: {SDPA_BACKENDS}")
     if compile_mode not in COMPILE_MODES:
         raise ValueError(f"unknown compile mode '{compile_mode}'. Valid options: {COMPILE_MODES}")
 
@@ -519,19 +514,19 @@ def run_benchmark(
     )
 
     print_request_set_summary(requests, repetitions, arrival_gap_ms, seed, device_name, vram)
-    print(f"  sdpa backend:          {sdpa_backend}")
+    print("  sdpa backend:          flash")
     if compile:
         print(f"  compile mode:          {compile_mode}")
 
-    engine = Engine(MODEL_NAME, compile=compile, compile_mode=compile_mode, sdpa_backend=sdpa_backend)
+    engine = Engine(MODEL_NAME, compile=compile, compile_mode=compile_mode)
     single_result = benchmark_single_request(engine, requests, repetitions)
     cleanup_engine(engine)
 
-    engine = Engine(MODEL_NAME, compile=compile, compile_mode=compile_mode, sdpa_backend=sdpa_backend)
+    engine = Engine(MODEL_NAME, compile=compile, compile_mode=compile_mode)
     static_batch_result = benchmark_static_batch(engine, requests, repetitions)
     cleanup_engine(engine)
 
-    engine = Engine(MODEL_NAME, compile=compile, compile_mode=compile_mode, sdpa_backend=sdpa_backend)
+    engine = Engine(MODEL_NAME, compile=compile, compile_mode=compile_mode)
     continuous_batch_result = benchmark_continuous_batch(engine, requests, repetitions, arrival_gap_ms)
     cleanup_engine(engine)
 
@@ -580,7 +575,6 @@ def run_benchmark(
             compile=compile,
             compile_mode=compile_mode,
             prefix_cache_max_tokens=prefix_cache_max_tokens,
-            sdpa_backend=sdpa_backend,
         )
         print_prefix_cache_comparison(baseline_result, cached_result)
 
@@ -633,7 +627,6 @@ def parse_args():
         default="default",
         help="torch.compile mode. Plain --compile uses the memory-friendlier default mode.",
     )
-    parser.add_argument("--sdpa-backend", choices=SDPA_BACKENDS, default="auto", help="Force a PyTorch SDPA backend.")
     parser.add_argument("--prefix-cache", action="store_true", help="Also benchmark shared-prefix prompts with prefix caching on vs off.")
     parser.add_argument("--prefix-shared-tokens", type=int, default=DEFAULT_PREFIX_SHARED_TOKENS)
     parser.add_argument("--prefix-suffix-tokens", type=int, default=DEFAULT_PREFIX_SUFFIX_TOKENS)
@@ -654,7 +647,6 @@ if __name__ == "__main__":
         verbose=args.verbose,
         compile=args.compile,
         compile_mode=args.compile_mode,
-        sdpa_backend=args.sdpa_backend,
         prefix_cache=args.prefix_cache,
         prefix_shared_tokens=args.prefix_shared_tokens,
         prefix_suffix_tokens=args.prefix_suffix_tokens,

@@ -6,7 +6,7 @@ from .block import TransformerBlock
 
 
 class Qwen3Model(nn.Module):
-    def __init__(self, sdpa_backend: str = "auto"):
+    def __init__(self):
         super().__init__()
 
         vocab_size = 151_936
@@ -31,7 +31,6 @@ class Qwen3Model(nn.Module):
                 hidden_size=hidden_size, num_heads=num_heads,
                 num_kv_groups=num_kv_groups, head_dim=head_dim,
                 intermediate_size=intermediate_size, rms_norm_eps=rms_norm_eps,
-                sdpa_backend=sdpa_backend,
             )
             for _ in range(num_layers)
         ])
