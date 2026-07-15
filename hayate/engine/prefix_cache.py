@@ -58,7 +58,9 @@ class PrefixCache:
             return
 
         key = tuple(tokens[:store_len])
-        entry = cache.slice(store_len, clone=store_len < cache.length)
+        # Active request caches use reserved mutable storage, so prefix entries
+        # must own a compact immutable copy.
+        entry = cache.slice(store_len, clone=True)
 
         existing = self._entries.pop(key, None)
         if existing is not None:

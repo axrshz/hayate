@@ -24,6 +24,7 @@ class Qwen3Model(nn.Module):
         self.num_kv_groups = num_kv_groups
         self.head_dim = head_dim
         self.max_position_embeddings = max_position_embeddings
+        self.rope_theta = rope_theta
 
         self.embed_tokens = nn.Embedding(vocab_size, hidden_size, dtype=torch.bfloat16)
         self.layers = nn.ModuleList([
@@ -44,8 +45,17 @@ class Qwen3Model(nn.Module):
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
 
+    def initialize_rope(self, device: torch.device | str) -> None:
+        """Materialize non-persistent RoPE buffers after meta-device construction."""
+        self.cos, self.sin = compute_rope_params(
+            head_dim=self.head_dim,
+            theta_base=self.rope_theta,
+            context_length=self.max_position_embeddings,
+            device=device,
+        )
+
     def forward(self, token_ids, prev_k=None, prev_v=None,
-                cache_lens=None, pad_lengths=None):
+                cache_lens=None, pad_lengths=None, use_varlen=False):
         """
         token_ids:    (B, T) int64
         prev_k,
@@ -56,7 +66,7 @@ class Qwen3Model(nn.Module):
         pad_lengths:  optional (B,) int64 tensor of per-request left-pad lengths in the
                       new-token region; only used during padded prefill.
 
-        Returns: logits (B, T, V), new_k, new_v (each (num_layers, B, H_kv, L_prev+T, D)).
+        Returns: logits (B, 1, V), new_k, new_v (each (num_layers, B, H_kv, T, D)).
         """
         B, T = token_ids.shape
         x = self.embed_tokens(token_ids)
@@ -77,41 +87,32 @@ class Qwen3Model(nn.Module):
         else:
             position_ids = arange_t + cl_1d  # broadcasts to (B, T)
 
-        # Attention mask over the concatenated [cache | new] tensor of length L_full.
-        # mask[b, r, j] = True means key j is invalid for query at row r of request b.
-        k_pos = torch.arange(L_full, device=x.device, dtype=torch.long).view(1, 1, -1)  # (1, 1, L_full)
-        q_col = (L_prev + arange_t).unsqueeze(-1)                                       # (1, T, 1)
+        varlen_metadata = None
+        if use_varlen:
+            if pad_lengths is None:
+                pad_lengths = torch.zeros(B, device=x.device, dtype=torch.long)
+            query_lens = T - pad_lengths
+            if cache_lens is None:
+                cache_lens = torch.zeros(B, device=x.device, dtype=torch.long)
+            key_lens = cache_lens + query_lens
 
-        # Causal mask: within the new-token region, row r at column L_prev+r can only
-        # attend to columns <= L_prev+r; cache-region columns (< L_prev) are never
-        # causal-violated by this definition.
-        mask = k_pos > q_col  # (1, T, L_full)
+            cu_q = torch.zeros(B + 1, device=x.device, dtype=torch.int32)
+            cu_k = torch.zeros(B + 1, device=x.device, dtype=torch.int32)
+            cu_q[1:] = query_lens.cumsum(0).to(torch.int32)
+            cu_k[1:] = key_lens.cumsum(0).to(torch.int32)
 
-        if L_prev > 0:
-            # Cache-region padding: columns [cache_lens[b], L_prev) are zero-padded and invalid.
-            cl_mask = cache_lens.view(-1, 1, 1)  # (B, 1, 1)
-            mask_cache_pad = (k_pos < L_prev) & (k_pos >= cl_mask)  # (B, 1, L_full)
-            mask = mask | mask_cache_pad
-
-        if pad_lengths is not None:
-            # New-region left-padding: columns [L_prev, L_prev+pl[b]) in the new region are
-            # pad tokens; real queries must not attend to them. Pad queries (row r < pl[b])
-            # intentionally keep their causal prefix unmasked so their attention output is
-            # finite — their logits are discarded downstream anyway.
-            pl_mask = pad_lengths.view(-1, 1, 1)  # (B, 1, 1)
-            real_row = arange_t.unsqueeze(-1) >= pl_mask  # (B, T, 1)
-            col_is_new_pad = (k_pos >= L_prev) & ((k_pos - L_prev) < pl_mask)  # (B, 1, L_full)
-            mask = mask | (col_is_new_pad & real_row)
-
-        mask = mask.unsqueeze(1)  # (B, 1, T, L_full)
-        attn_mask = torch.zeros_like(mask, dtype=x.dtype).masked_fill(mask, float("-inf"))
+            valid_q = arange_t >= pad_lengths.view(-1, 1)
+            cache_pos = torch.arange(L_prev, device=x.device).view(1, -1)
+            valid_cache = cache_pos < cache_lens.view(-1, 1)
+            valid_k = torch.cat([valid_cache, valid_q], dim=1)
+            varlen_metadata = (valid_q, valid_k, cu_q, cu_k, T, L_full, T > 1)
 
         new_k_list = []
         new_v_list = []
         for layer_idx, block in enumerate(self.layers):
             pk = prev_k[layer_idx] if prev_k is not None else None
             pv = prev_v[layer_idx] if prev_v is not None else None
-            x, nk, nv = block(x, attn_mask, self.cos, self.sin, position_ids, pk, pv)
+            x, nk, nv = block(x, self.cos, self.sin, position_ids, pk, pv, varlen_metadata)
             new_k_list.append(nk)
             new_v_list.append(nv)
 
@@ -121,5 +122,7 @@ class Qwen3Model(nn.Module):
         new_v = torch.stack(new_v_list, dim=0)
 
         x = self.norm(x)
-        logits = self.out_head(x)
+        # Generation only consumes the final real token's logits. Avoid projecting
+        # every prompt token through the very large vocabulary head during prefill.
+        logits = self.out_head(x[:, -1:, :])
         return logits, new_k, new_v

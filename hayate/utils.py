@@ -192,3 +192,5 @@ def load_weights(model, repo_id: str):
 
     if not lm_head_loaded:
         model.out_head.weight = model.embed_tokens.weight
+
+    return local_dir

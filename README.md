@@ -1,94 +1,72 @@
 # hayate
 
-Inference engine for Qwen3-4B. WIP.
+Learning-focused inference engine for `Qwen/Qwen3-4B` on NVIDIA GPUs.
+
+Features:
+
+- BF16 inference with Flash Attention
+- KV caching and continuous batching
+- Variable-length prompt batches
+- Optional `torch.compile` and prefix caching
 
 ## Setup
 
-`hayate` requires Python `3.12+`.
+Requires Python 3.12+, CUDA, and an NVIDIA GPU.
 
 ```bash
-uv venv
+uv sync --locked
 source .venv/bin/activate
-uv pip install -e .
 ```
 
-## Run
-
-Run the benchmark with batch size:
-
-```bash
-python benchmark.py 10
-```
-
-Use `--verbose` if you want the detailed per-mode breakdown:
-
-```bash
-python benchmark.py 10 --verbose
-```
-
-Pass `--compile` to wrap the model in `torch.compile(..., dynamic=True)`. The
-default compile mode avoids CUDA Graph private pools, which keeps memory use lower
-on 24GB GPUs.
-
-```bash
-python benchmark.py 10 --compile
-```
-
-Hayate uses PyTorch Flash SDPA for attention, so run it on an NVIDIA GPU.
-
-Prefix caching is available as an opt-in engine feature for workloads where prompts
-share token prefixes:
+## Inference
 
 ```python
 from hayate.engine.engine import Engine
 
-engine = Engine("Qwen/Qwen3-4B", enable_prefix_cache=True)
+engine = Engine("Qwen/Qwen3-4B")
+result = engine.generate_text("Explain artificial general intelligence")
+print(result.response)
 ```
 
-The cache stores reusable prompt KV prefixes with a token budget. The default budget
-is 4096 cached prefix tokens; pass `prefix_cache_max_tokens=...` to tune VRAM usage.
+Enable compilation for repeated single-request or uniform-batch workloads:
 
-To benchmark prefix caching, run the benchmark with a generated shared-prefix
-workload:
-
-```bash
-python benchmark.py 10 --prefix-cache
+```python
+engine = Engine("Qwen/Qwen3-4B", compile=True)
 ```
 
-Tune the synthetic workload with `--prefix-shared-tokens`,
-`--prefix-suffix-tokens`, and `--prefix-cache-max-tokens`.
+Enable prefix caching when requests share prompt prefixes:
+
+```python
+engine = Engine(
+    "Qwen/Qwen3-4B",
+    enable_prefix_cache=True,
+    prefix_cache_max_tokens=4096,
+)
+```
 
 ## Benchmark
 
-`Qwen/Qwen3-4B` on an `RTX 3090 (24GB)`, 10 requests, 5 reps.
+```bash
+# Prefill and decode
+python benchmark.py --suite micro
 
-without `--compile`:
+# Saturated throughput
+python benchmark.py --suite offline
 
-```text
-mode                       mean        p50        p95  total tok/s
--------------------- ---------- ---------- ---------- ------------
-single request           9.872s     9.801s    10.254s       48.73
-submit all upfront      12.925s    12.875s    13.072s      372.15
-staggered arrivals      13.105s    13.080s    13.508s      361.49
+# Poisson-arrival serving load
+python benchmark.py --suite online
+
+# All suites with JSON output
+python benchmark.py --suite all --json benchmark-results.json
 ```
 
-with `--compile`:
+The benchmark uses fixed input/output lengths and reports prompt throughput,
+output throughput, TTFT, TPOT, goodput, and peak VRAM. Run
+`python benchmark.py --help` for workload and batch controls.
 
-```text
-mode                       mean        p50        p95  total tok/s
--------------------- ---------- ---------- ---------- ------------
-single request           4.382s     4.373s     4.571s      109.78
-submit all upfront       9.459s     9.396s     9.727s      508.51
-staggered arrivals       9.704s     9.627s    10.230s      485.16
-```
+## Limitations
 
-## Todo
-
-- [x] model architecture
-- [x] kv caching
-- [x] greedy decoding
-- [x] continuous batching
-- [x] torch.compile
-- [x] prefix caching
-- [x] pytorch sdpa
-- [ ] paged attention
+- Architecture and weights are specific to Qwen3-4B.
+- Sampling is greedy only.
+- Paged attention is not implemented.
+- Variable-length attention requires PyTorch 2.10.
