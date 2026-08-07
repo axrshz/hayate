@@ -1,21 +1,22 @@
-import torch
 from typing import List, Union
+
+import torch
 from transformers import AutoTokenizer, GenerationConfig
 
-from hayate.model import Qwen3Model
-from hayate.utils import load_weights
-from hayate.model.cache import Cache
-from hayate.engine.prefix_cache import PrefixCache
+from hayate.engine.cache_ops import gather_caches, scatter_caches
 from hayate.engine.constants import (
     COMPILE_MODES,
     DEFAULT_PREFIX_CACHE_MAX_TOKENS,
     MAX_PREFILL_BATCH,
     device,
 )
+from hayate.engine.prefix_cache import PrefixCache
 from hayate.engine.request import Request
-from hayate.engine.cache_ops import gather_caches, scatter_caches
 from hayate.engine.sampler import Sampler
 from hayate.engine.scheduler import Scheduler
+from hayate.model import Qwen3Model
+from hayate.model.cache import Cache
+from hayate.utils import load_weights
 
 
 class Engine:
@@ -30,11 +31,10 @@ class Engine:
         if not torch.cuda.is_available():
             raise RuntimeError("hayate requires an NVIDIA CUDA GPU")
         if compile_mode not in COMPILE_MODES:
-            raise ValueError(f"unknown compile mode '{compile_mode}'. Valid options: {COMPILE_MODES}")
-
-        # Construct on the meta device so PyTorch does not initialize an 8GB set
-        # of random CPU weights that the checkpoint immediately overwrites.
-        with torch.device("meta"):
+            raise ValueError(
+                f"unknown compile mode '{compile_mode}'. Valid options: {COMPILE_MODES}"
+            )
+        with torch.device("cuda"):
             self.model = Qwen3Model()
         self.num_layers = self.model.num_layers
         self.num_kv_groups = self.model.num_kv_groups
@@ -45,17 +45,18 @@ class Engine:
         model_dir = load_weights(self.model, model_name)
         self.model.eval()
         if compile:
-            # dynamic=True lets Dynamo handle varying batch size and cache length.
-            # The default compile mode is friendlier to 24GB GPUs than reduce-overhead,
-            # which uses CUDA Graph private pools for every new decode cache length.
             if compile_mode == "default":
                 self.model = torch.compile(self.model, dynamic=True)
             else:
                 self.model = torch.compile(self.model, dynamic=True, mode=compile_mode)
-        self.tokenizer = AutoTokenizer.from_pretrained(model_dir, use_fast=True, local_files_only=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_dir, use_fast=True, local_files_only=True
+        )
         self.stop_token_ids = self._load_stop_token_ids(model_dir)
         self.scheduler = Scheduler()
-        self.prefix_cache = PrefixCache(prefix_cache_max_tokens) if enable_prefix_cache else None
+        self.prefix_cache = (
+            PrefixCache(prefix_cache_max_tokens) if enable_prefix_cache else None
+        )
         self.sampler = Sampler(self.tokenizer, self.stop_token_ids)
 
     def _load_stop_token_ids(self, model_name: str) -> set[int]:
@@ -96,7 +97,9 @@ class Engine:
 
         # Keep at least one prompt token for prefill so we can compute next-token logits.
         max_prefix_len = max(len(request.prompt_tokens) - 1, 0)
-        match = self.prefix_cache.get(request.prompt_tokens, max_prefix_len=max_prefix_len)
+        match = self.prefix_cache.get(
+            request.prompt_tokens, max_prefix_len=max_prefix_len
+        )
         if match.cache is None or match.length == 0:
             return
 
@@ -125,26 +128,34 @@ class Engine:
     def _store_prompt_prefix(self, request: Request):
         if self.prefix_cache is None or request.kv_cache is None:
             return
-        if not request.prompt_tokens or request.kv_cache.length < len(request.prompt_tokens):
+        if not request.prompt_tokens or request.kv_cache.length < len(
+            request.prompt_tokens
+        ):
             return
         self.prefix_cache.put(request.prompt_tokens, request.kv_cache)
 
     def _forward_pass(self, tokens, requests: List[Request], pad_lengths_py=None):
         """One model forward pass over a batch of requests. Returns last-token logits (B, V)."""
-        prev_k, prev_v, cache_lens, cache_lens_py = gather_caches(requests, self.num_layers)
+        prev_k, prev_v, cache_lens, cache_lens_py = gather_caches(
+            requests, self.num_layers
+        )
         L_prev = prev_k.shape[3] if prev_k is not None else 0
         T = tokens.shape[1]
 
         pad_lengths_tensor = None
         if pad_lengths_py is not None and any(pad_lengths_py):
-            pad_lengths_tensor = torch.tensor(pad_lengths_py, dtype=torch.long, device=tokens.device)
+            pad_lengths_tensor = torch.tensor(
+                pad_lengths_py, dtype=torch.long, device=tokens.device
+            )
 
         # Flash SDPA cannot consume an explicit padding mask. PyTorch's varlen
         # Flash kernel handles packed uneven sequences without falling back to
         # quadratic math attention. A cached multi-token suffix also needs the
         # varlen kernel's bottom-right causal alignment.
         uneven_cache = len(set(cache_lens_py)) > 1
-        use_varlen = pad_lengths_tensor is not None or uneven_cache or (L_prev > 0 and T > 1)
+        use_varlen = (
+            pad_lengths_tensor is not None or uneven_cache or (L_prev > 0 and T > 1)
+        )
 
         # torch.compile currently graph-breaks around varlen_attn and is slower
         # than eager execution for uneven batches. Keep compiled dense/uniform
@@ -187,12 +198,18 @@ class Engine:
 
         max_len = max(len(t) for t in suffix_tokens)
 
-        pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+        pad_id = (
+            self.tokenizer.pad_token_id
+            if self.tokenizer.pad_token_id is not None
+            else 0
+        )
         padded = [([pad_id] * (max_len - len(t))) + t for t in suffix_tokens]
         pad_lengths_py = [max_len - len(t) for t in suffix_tokens]
         tokens = torch.tensor(padded, device=device)
 
-        last_logits = self._forward_pass(tokens, requests, pad_lengths_py=pad_lengths_py)
+        last_logits = self._forward_pass(
+            tokens, requests, pad_lengths_py=pad_lengths_py
+        )
         next_tokens = self.sampler.sample(last_logits)
         next_token_ids = next_tokens.flatten().tolist()
 
@@ -238,7 +255,9 @@ class Engine:
 
         requests = []
         for prompt in prompts:
-            req = Request(id=self.scheduler.request_id, prompt=prompt, max_tokens=max_tokens)
+            req = Request(
+                id=self.scheduler.request_id, prompt=prompt, max_tokens=max_tokens
+            )
             self.scheduler.request_id += 1
             self.add_request(req)
             requests.append(req)

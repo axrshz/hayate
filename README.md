@@ -6,8 +6,9 @@ Features:
 
 - BF16 inference with Flash Attention
 - KV caching and continuous batching
+- Chucked prefill and greedy decoding
 - Variable-length prompt batches
-- Optional `torch.compile` and prefix caching
+- Supports `torch.compile` and prefix caching
 
 ## Setup
 
@@ -28,13 +29,13 @@ result = engine.generate_text("Explain artificial general intelligence")
 print(result.response)
 ```
 
-Enable compilation for repeated single-request or uniform-batch workloads:
+Enable `torch.compile` with default mode:
 
 ```python
 engine = Engine("Qwen/Qwen3-4B", compile=True)
 ```
 
-Enable prefix caching when requests share prompt prefixes:
+Enable prefix caching:
 
 ```python
 engine = Engine(
@@ -47,22 +48,19 @@ engine = Engine(
 ## Benchmark
 
 ```bash
-# Prefill and decode
-python benchmark.py --suite micro
+# Default: batch 1, 512 prompt tokens, 64 decode steps
+python benchmark.py
 
-# Saturated throughput
-python benchmark.py --suite offline
+# Custom workload
+python benchmark.py --batch-size 4 --context-tokens 2048 --decode-steps 128
 
-# Poisson-arrival serving load
-python benchmark.py --suite online
-
-# All suites with JSON output
-python benchmark.py --suite all --json benchmark-results.json
+# Save the same result as JSON
+python benchmark.py --json benchmark-results.json
 ```
 
-The benchmark uses fixed input/output lengths and reports prompt throughput,
-output throughput, TTFT, TPOT, goodput, and peak VRAM. Run
-`python benchmark.py --help` for workload and batch controls.
+The benchmark measures prefill latency and throughput, decode step latency and
+throughput, and peak VRAM for one fixed workload. Run `python benchmark.py --help`
+for controls.
 
 ## Limitations
 

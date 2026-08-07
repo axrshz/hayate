@@ -1,1 +1,1 @@
-"""Controlled performance benchmarks for Hayate."""
+"""Hayate prefill and decode benchmark."""
