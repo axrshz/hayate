@@ -61,10 +61,3 @@ python benchmark.py --json benchmark-results.json
 The benchmark measures prefill latency and throughput, decode step latency and
 throughput, and peak VRAM for one fixed workload. Run `python benchmark.py --help`
 for controls.
-
-## Limitations
-
-- Architecture and weights are specific to Qwen3-4B.
-- Sampling is greedy only.
-- Paged attention is not implemented.
-- Variable-length attention requires PyTorch 2.10.
