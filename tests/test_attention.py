@@ -2,11 +2,11 @@ import unittest
 
 import torch
 
-from hayate.model.attention import GroupedQueryAttention, varlen_attn
+from hayate.model.attention import GroupedQueryAttention
 from hayate.model.rope import compute_rope_params
 
 
-@unittest.skipUnless(torch.cuda.is_available() and varlen_attn is not None, "CUDA varlen attention required")
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA varlen attention required")
 class VariableLengthAttentionTests(unittest.TestCase):
     def test_packed_batch_matches_individual_flash_attention(self):
         torch.manual_seed(7)

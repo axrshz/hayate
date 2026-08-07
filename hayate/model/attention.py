@@ -4,18 +4,11 @@ import torch.nn.functional as F
 
 from .rope import apply_rope_vectorized
 
-try:
-    from torch.nn.attention import SDPBackend, sdpa_kernel
-    from torch.nn.attention.varlen import varlen_attn
-except ImportError:  # pragma: no cover - kept for older local torch installs
-    SDPBackend = None
-    sdpa_kernel = None
-    varlen_attn = None
+from torch.nn.attention import SDPBackend, sdpa_kernel
+from torch.nn.attention.varlen import varlen_attn
 
 
 def _flash_sdpa_context():
-    if sdpa_kernel is None or SDPBackend is None:
-        raise RuntimeError("Flash SDPA requires torch.nn.attention.sdpa_kernel")
     # Explicit masks are not accepted by the Flash backend in current PyTorch.
     # Keep the math backend available as a correctness fallback; optimized paths
     # below avoid the mask and therefore still select Flash Attention.
@@ -72,8 +65,6 @@ class GroupedQueryAttention(nn.Module):
             full_k, full_v = k, v
 
         if varlen_metadata is not None:
-            if varlen_attn is None:
-                raise RuntimeError("variable-length Flash Attention requires PyTorch 2.10+")
             valid_q, valid_k, cu_q, cu_k, max_q, max_k, is_causal = varlen_metadata
             q_packed = q.transpose(1, 2)[valid_q]
             k_packed = full_k.transpose(1, 2)[valid_k]

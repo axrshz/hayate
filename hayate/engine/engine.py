@@ -27,6 +27,8 @@ class Engine:
         enable_prefix_cache: bool = False,
         prefix_cache_max_tokens: int = DEFAULT_PREFIX_CACHE_MAX_TOKENS,
     ):
+        if not torch.cuda.is_available():
+            raise RuntimeError("hayate requires an NVIDIA CUDA GPU")
         if compile_mode not in COMPILE_MODES:
             raise ValueError(f"unknown compile mode '{compile_mode}'. Valid options: {COMPILE_MODES}")
 
@@ -83,14 +85,9 @@ class Engine:
         if not request.prompt_tokens:
             request.prompt_tokens = self.tokenizer.encode(request.prompt)
 
-        if not request.use_cache:
-            raise ValueError("use_cache=False is not supported by decode; leave request caching enabled")
-
         self._validate_request_lengths(request)
 
         if request.kv_cache is not None and request.kv_cache.length > 0:
-            request.cache_pos = request.kv_cache.length
-            request.prefix_cache_len = request.cache_pos
             return
 
         request.kv_cache = Cache()
@@ -104,8 +101,6 @@ class Engine:
             return
 
         request.kv_cache = match.cache
-        request.cache_pos = match.length
-        request.prefix_cache_len = match.length
 
     def _validate_request_lengths(self, request: Request):
         if request.max_tokens < 1:
@@ -128,7 +123,7 @@ class Engine:
             self.prefix_cache.clear()
 
     def _store_prompt_prefix(self, request: Request):
-        if self.prefix_cache is None or not request.use_cache or request.kv_cache is None:
+        if self.prefix_cache is None or request.kv_cache is None:
             return
         if not request.prompt_tokens or request.kv_cache.length < len(request.prompt_tokens):
             return
@@ -173,7 +168,6 @@ class Engine:
 
     def prefill_batch(self, requests: List[Request]):
         """Batched prefill for multiple requests in a single forward pass."""
-        all_tokens = []
         suffix_tokens = []
         for request in requests:
             if not request.prompt_tokens:
@@ -184,14 +178,12 @@ class Engine:
             # A full prompt cache cannot produce next-token logits by itself. Leave the
             # final prompt token for prefill so the model emits the first sampled token.
             max_prefix_len = len(request.prompt_tokens) - 1
-            if request.cache_pos > max_prefix_len:
-                request.cache_pos = max_prefix_len
-                request.prefix_cache_len = min(request.prefix_cache_len, request.cache_pos)
-                if request.kv_cache is not None:
-                    request.kv_cache = request.kv_cache.slice(request.cache_pos)
+            cache_pos = request.kv_cache.length if request.kv_cache is not None else 0
+            if cache_pos > max_prefix_len:
+                cache_pos = max_prefix_len
+                request.kv_cache = request.kv_cache.slice(cache_pos)
 
-            all_tokens.append(request.prompt_tokens)
-            suffix_tokens.append(request.prompt_tokens[request.cache_pos:])
+            suffix_tokens.append(request.prompt_tokens[cache_pos:])
 
         max_len = max(len(t) for t in suffix_tokens)
 
@@ -205,9 +197,7 @@ class Engine:
         next_token_ids = next_tokens.flatten().tolist()
 
         for i, request in enumerate(requests):
-            request.prompt_tokens = all_tokens[i]
             self.sampler.finalize(request, next_token_ids[i])
-            request.cache_pos = len(all_tokens[i])
             request.is_prefill = False
             self._store_prompt_prefix(request)
 
@@ -220,7 +210,6 @@ class Engine:
         next_token_ids = next_tokens.flatten().tolist()
 
         for i, request in enumerate(requests):
-            request.cache_pos += 1
             tok = next_token_ids[i]
             self.sampler.finalize(request, tok)
 
@@ -258,9 +247,3 @@ class Engine:
             pass
 
         return requests[0] if len(requests) == 1 else requests
-
-
-if __name__ == "__main__":
-    engine = Engine("Qwen/Qwen3-4B")
-    result = engine.generate_text("Explain AGI")
-    print(result.response)

@@ -71,7 +71,7 @@ def scatter_caches(
     storage without copying the existing cache history.
     """
     for i, r in enumerate(requests):
-        if r.kv_cache is None or not r.use_cache:
+        if r.kv_cache is None:
             continue
         pl = pad_lengths_py[i] if pad_lengths_py is not None else 0
         k_new = new_k[:, i, :, pl:num_tokens, :]

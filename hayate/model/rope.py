@@ -22,24 +22,9 @@ def compute_rope_params(
     return cos, sin
 
 
-def apply_rope(x, cos, sin, start_positions = 0):
-    batch_size, num_heads, seq_len, head_dim = x.shape
-    assert head_dim % 2 == 0, "Head dimension must be even"
-
-    x1 = x[..., : head_dim // 2]  # first half
-    x2 = x[..., head_dim // 2 :]  # second half
-
-    cos = cos[start_positions: start_positions + seq_len, :].unsqueeze(0).unsqueeze(0) # (1, 1, seq_len, head_dim)
-    sin = sin[start_positions: start_positions + seq_len, :].unsqueeze(0).unsqueeze(0) 
-
-    rotated = torch.cat((-x2, x1), dim=-1)
-    x_rotated = (x * cos) + (rotated * sin)
-
-    return x_rotated.to(dtype=x.dtype)
-
 def apply_rope_vectorized(x, cos, sin, position_ids):
     """position_ids: (batch_size, seq_len) long tensor of absolute positions"""
-    batch_size, num_heads, seq_len, head_dim = x.shape
+    head_dim = x.shape[-1]
     assert head_dim % 2 == 0, "Head dimension must be even"
 
     x1 = x[..., : head_dim // 2]

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import random
 import time
 from pathlib import Path
 
@@ -112,9 +111,6 @@ def main() -> None:
     args = parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("the benchmark requires an NVIDIA CUDA GPU")
-    random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    torch.cuda.manual_seed_all(args.seed)
 
     load_started = time.perf_counter()
     engine = Engine(args.model, compile=args.compile, compile_mode=args.compile_mode)

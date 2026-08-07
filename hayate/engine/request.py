@@ -14,10 +14,7 @@ class Request:
     tokens: List[int] = field(default_factory=list)
     kv_cache: Cache | None = None
 
-    cache_pos: int = 0
-    prefix_cache_len: int = 0
     is_completed: bool = False
     is_prefill: bool = True
-    use_cache: bool = True
 
     response: str | None = None
