@@ -6,12 +6,6 @@ from hayate.engine.request import Request
 
 
 def gather_caches(requests: List[Request], num_layers: int):
-    """Stack per-request caches into a single batched, right-padded tensor.
-
-    Returns (prev_k, prev_v, cache_lens) where prev_k/prev_v have shape
-    (num_layers, B, H_kv, L_max, D), or (None, None, None) when no request has
-    any cached K/V yet (pure prefill).
-    """
     batch_size = len(requests)
     cache_lens_py: List[int] = []
     ref: torch.Tensor | None = None
@@ -63,13 +57,6 @@ def scatter_caches(
     num_tokens: int,
     pad_lengths_py: List[int] | None = None,
 ):
-    """Split updated batched caches back into per-request Cache storage.
-
-    new_k, new_v: (num_layers, B, H_kv, T, D) newly computed model states.
-
-    Padding is stripped and real tokens are appended to reserved per-request
-    storage without copying the existing cache history.
-    """
     for i, r in enumerate(requests):
         if r.kv_cache is None:
             continue
