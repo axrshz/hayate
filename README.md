@@ -120,3 +120,32 @@ python benchmark.py --json benchmark-results.json
 The benchmark measures prefill latency and throughput, decode step latency and
 throughput, and peak VRAM for one fixed workload. Run `python benchmark.py --help`
 for controls.
+
+### Measured results
+
+These results use an NVIDIA RTX 4090 and `Qwen/Qwen3-4B`. Each request uses 512
+prompt tokens and 64 decode steps. Each value is the median of 3 repetitions.
+The first table uses eager mode, with `--compile` disabled. Throughput is the
+total for all requests in the batch. The eager runs completed through batch 20
+without an out-of-memory (OOM) error.
+
+| Batch | Prefill throughput | Decode throughput | Peak VRAM |
+| ---: | ---: | ---: | ---: |
+| 2 | 13.8k tok/s | 58.5 tok/s | 10.67 GB |
+| 4 | 16.4k tok/s | 118.5 tok/s | 10.76 GB |
+| 8 | 16.6k tok/s | 224.5 tok/s | 10.95 GB |
+| 16 | 16.6k tok/s | 459.5 tok/s | 11.33 GB |
+| 20 | 16.7k tok/s | 544.4 tok/s | 11.52 GB |
+
+Decode throughput increased 9.3× when batch size increased 10×. This is 93% of
+the linear gain. Prefill throughput was almost the same at batches 8, 16, and 20.
+
+At batch 20, the `torch.compile` result was 12.7k prefill tok/s and 62.2 decode
+tok/s. Peak VRAM was 17.04 GB. The eager result was 16.7k prefill tok/s, 544.4
+decode tok/s, and 11.52 GB peak VRAM. The compile result was 0.76× the eager
+prefill throughput and 0.11× the eager decode throughput. It used 48% more peak
+VRAM.
+
+These results show that decode throughput was near the linear rate as batch size
+increased. Prefill throughput was almost the same from batch 8 to batch 20. In
+this benchmark, `torch.compile` did not increase speed.
