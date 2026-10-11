@@ -77,6 +77,33 @@ size as its block size and only compiles blocks its kernel tiles divide.
 The configured capacity includes prompt and cached generated-token positions;
 requests that exceed the available pool raise `MemoryError`.
 
+## HTTP stream
+
+The HTTP interface sends text as Server-Sent Events (SSE). Install the API
+packages and start the server:
+
+```bash
+uv sync --locked --extra api
+python -m hayate.api --model Qwen/Qwen3-4B --host 127.0.0.1 --port 8000
+```
+
+Send a `POST` request to `/generate` with a prompt:
+
+```bash
+curl -N http://127.0.0.1:8000/generate \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"Explain artificial intelligence","max_tokens":100}'
+```
+
+The server sends a `started` event, then a `token` event after each new token.
+Each `token` event includes the token ID, token count, and full response text.
+The server sends a `completed` event when generation ends. Each `started` event
+includes the request ID.
+
+Send a `POST` request to `/requests/{request_id}/cancel` to stop that request.
+The engine stops the request after that model step. The server also stops a
+request when its client disconnects. Use `/docs` to view the API.
+
 ## Benchmark
 
 ```bash

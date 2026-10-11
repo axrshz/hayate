@@ -15,6 +15,12 @@ dependencies = [
     "huggingface_hub",
 ]
 
+[project.optional-dependencies]
+api = [
+    "fastapi>=0.115,<1",
+    "uvicorn>=0.30,<1",
+]
+
 [tool.setuptools.packages.find]
 # Install the hayate package and its subpackages.
 where = ["."]

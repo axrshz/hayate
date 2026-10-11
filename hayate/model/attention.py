@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from .rope import apply_rope_vectorized
 
 from torch.nn.attention import SDPBackend, sdpa_kernel
+from torch.nn.attention.bias import causal_lower_right
 from torch.nn.attention.varlen import varlen_attn
 
 
@@ -104,15 +105,24 @@ class GroupedQueryAttention(nn.Module):
                 # Restore each packed result to its original batch and token position.
                 context[valid_q] = packed_context
             else:
-                # Dense batches need no padding mask, so PyTorch can use Flash Attention.
+                # With cached chunks, align causal rows to the end of the KV sequence.
+                # SDPA's built-in causal mask starts at key position zero, while these
+                # queries start after the cached history.
+                attn_mask = None
+                is_causal = T > 1
+                if prev_k is not None and T > 1:
+                    attn_mask = causal_lower_right(T, full_k.shape[2])
+                    is_causal = False
+
+                # Uncached dense batches can use Flash Attention's causal mode.
                 with _flash_sdpa_context():
                     context = F.scaled_dot_product_attention(
                         q,
                         full_k,
                         full_v,
-                        attn_mask=None,
+                        attn_mask=attn_mask,
                         dropout_p=0.0,
-                        is_causal=T > 1,
+                        is_causal=is_causal,
                         enable_gqa=True,
                     ).transpose(1, 2)
         context = context.reshape(B, T, self.num_heads * self.head_dim)

@@ -133,6 +133,40 @@ class Engine:
         self._prepare_request(request)
         self.scheduler.add(request)
 
+    def submit_request(
+        self,
+        prompt: str,
+        max_tokens: int = 100,
+        temperature: float = 0.0,
+        top_k: int | None = None,
+        top_p: float | None = None,
+    ) -> Request:
+        """Prepare and queue one prompt, then return its request state."""
+        request = Request(
+            id=self.scheduler.request_id,
+            prompt=prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+        )
+        self.scheduler.request_id += 1
+        self.add_request(request)
+        return request
+
+    def cancel_request(self, request: Request) -> bool:
+        """Cancel a queued or active request and release its cache."""
+        if request.is_completed:
+            return False
+        request.is_cancelled = True
+        request.is_completed = True
+        request.response = self.tokenizer.decode(
+            request.tokens, skip_special_tokens=True
+        )
+        self.scheduler.remove(request)
+        self.release_request_cache(request)
+        return True
+
     def _prepare_request(self, request: Request):
         """Tokenize the prompt, check its size, and reuse a matching cached prefix."""
         self.sampler.validate_parameters(
@@ -290,6 +324,11 @@ class Engine:
 
     def generate(self):
         """Run one scheduler tick and return whether any request remains active."""
+        # A request can be canceled while it waits behind a full active batch.
+        for request in self.scheduler.cancelled_waiting():
+            if not request.is_completed:
+                self.cancel_request(request)
+
         previous_batch = list(self.scheduler.current_batch)
         batch = self.scheduler.tick()
         active_ids = {id(request) for request in batch}
@@ -298,6 +337,15 @@ class Engine:
                 self.release_request_cache(request)
         if not batch:
             return False
+
+        # A cancellation request can arrive while a prior GPU step runs.
+        # Stop flagged requests before they start another model step.
+        for request in batch:
+            if request.is_cancel_requested and not request.is_completed:
+                self.cancel_request(request)
+        batch = [request for request in batch if not request.is_completed]
+        if not batch:
+            return bool(self.scheduler.current_batch or not self.scheduler.pool.empty())
 
         # New requests need prompt prefill; active requests need one-token decode.
         prefill_requests = [r for r in batch if r.is_prefill]
@@ -311,7 +359,22 @@ class Engine:
         if decode_requests:
             self.decode_batch(decode_requests)
 
-        return True
+        # A cancellation can also arrive during this model step. Apply it now
+        # so the request does not receive another decode step.
+        for request in batch:
+            if request.is_cancel_requested and not request.is_completed:
+                self.cancel_request(request)
+
+        # Release completed requests in this tick. This makes cancelled and
+        # normally completed requests return their pages without an extra tick.
+        self.scheduler.current_batch = [
+            request for request in batch if not request.is_completed
+        ]
+        for request in batch:
+            if request.is_completed:
+                self.release_request_cache(request)
+
+        return bool(self.scheduler.current_batch or not self.scheduler.pool.empty())
 
     def generate_text(
         self,
@@ -329,16 +392,13 @@ class Engine:
         requests = []
         # Each request receives an ID that stays unique for this engine.
         for prompt in prompts:
-            req = Request(
-                id=self.scheduler.request_id,
+            req = self.submit_request(
                 prompt=prompt,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 top_k=top_k,
                 top_p=top_p,
             )
-            self.scheduler.request_id += 1
-            self.add_request(req)
             requests.append(req)
 
         # Each tick handles one prompt step or one decode step for active requests.

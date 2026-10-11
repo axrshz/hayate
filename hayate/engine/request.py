@@ -23,6 +23,8 @@ class Request:
     # The engine uses these flags to choose prefill, decode, and cleanup steps.
     is_completed: bool = False
     is_prefill: bool = True
+    is_cancel_requested: bool = False
+    is_cancelled: bool = False
 
     # The sampler fills this field after a stop condition completes the request.
     response: str | None = None

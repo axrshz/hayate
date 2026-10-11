@@ -90,6 +90,7 @@ def release(engine: Engine, requests: list[Request]) -> None:
     engine.scheduler.current_batch.clear()
     while not engine.scheduler.pool.empty():
         engine.scheduler.pool.get()
+        engine.scheduler.pool.task_done()
     for request in requests:
         engine.release_request_cache(request)
     gc.collect()
