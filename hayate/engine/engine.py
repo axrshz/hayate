@@ -19,7 +19,6 @@ from hayate.engine.request import Request
 from hayate.engine.sampler import Sampler
 from hayate.engine.scheduler import Scheduler
 from hayate.model import Qwen3Model
-from hayate.model.cache import Cache
 from hayate.utils import load_weights
 
 
@@ -182,8 +181,6 @@ class Engine:
         if request.kv_cache is not None and request.kv_cache.length > 0:
             return
 
-        # Every request owns its active cache, even when no prefix can be reused.
-        request.kv_cache = Cache()
         if self.prefix_cache is None:
             return
 
@@ -225,11 +222,13 @@ class Engine:
             return
         if request.paged_cache.length < len(request.prompt_tokens):
             return
+        snapshot_len = min(len(request.prompt_tokens), self.prefix_cache.max_tokens)
+        if snapshot_len == 0:
+            return
         snapshot = self.paged_cache.snapshot(
-            request.paged_cache, len(request.prompt_tokens)
+            request.paged_cache, snapshot_len
         )
-        self.prefix_cache.put(request.prompt_tokens, snapshot)
-        snapshot.reset()
+        self.prefix_cache.put(request.prompt_tokens, snapshot, take_ownership=True)
 
     def release_request_cache(self, request: Request) -> None:
         """Release a request's pages and any temporary contiguous cache."""
@@ -240,10 +239,8 @@ class Engine:
             request.kv_cache.reset()
             request.kv_cache = None
 
-    def _forward_pass(self, tokens, requests: List[Request], pad_lengths_py=None):
+    def _forward_pass(self, tokens, requests: List[Request]):
         """Run one model step and append its new key and value states to each request."""
-        if pad_lengths_py is not None and any(pad_lengths_py):
-            raise ValueError("paged attention requires unpadded request chunks")
         T = tokens.shape[1]
         handles = [request.paged_cache for request in requests]
         if any(handle is None for handle in handles):
@@ -314,7 +311,7 @@ class Engine:
         # Decode processes one prior output token for each unfinished request.
         tokens = torch.tensor([[r.tokens[-1]] for r in requests], device=device)
 
-        last_logits = self._forward_pass(tokens, requests, pad_lengths_py=None)
+        last_logits = self._forward_pass(tokens, requests)
         next_tokens = self.sampler.sample(last_logits, requests)
         next_token_ids = next_tokens.flatten().tolist()
 

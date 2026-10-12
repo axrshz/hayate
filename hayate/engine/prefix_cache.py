@@ -58,8 +58,10 @@ class PrefixCache:
         self._entries.move_to_end(best_key)
         return PrefixCacheMatch(best_len, self._entries[best_key].slice(best_len))
 
-    def put(self, tokens: Sequence[int], cache: Cache) -> None:
-        """Store a compact snapshot of the prompt states within the token budget."""
+    def put(
+        self, tokens: Sequence[int], cache: Cache, *, take_ownership: bool = False
+    ) -> None:
+        """Store prompt states, optionally taking ownership of an exact-size snapshot."""
         if self.max_tokens == 0 or not tokens or cache.length == 0:
             return
 
@@ -68,8 +70,11 @@ class PrefixCache:
             return
 
         key = tuple(tokens[:store_len])
-        # Active request caches can change, so prefix entries need independent storage.
-        entry = cache.slice(store_len, clone=True)
+        if take_ownership and store_len == cache.length:
+            entry = cache
+        else:
+            # Active request caches can change, so prefix entries need independent storage.
+            entry = cache.slice(store_len, clone=True)
 
         existing = self._entries.pop(key, None)
         if existing is not None:
